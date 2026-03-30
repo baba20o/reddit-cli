@@ -223,25 +223,50 @@ class RedditClient:
         limit: int = 25,
         after: Optional[str] = None,
     ) -> dict:
-        """Search Reddit comments."""
-        if subreddit:
-            path = f"/r/{subreddit}/search"
-        else:
-            path = "/search"
+        """Search Reddit comments by finding relevant posts and fetching their top comments.
 
-        params = {
-            "q": query,
-            "sort": sort,
-            "t": time_filter,
-            "limit": min(limit, 100),
-            "type": "comment",
-            "restrict_sr": "true" if subreddit else "false",
+        Reddit's /search?type=comment endpoint is unreliable (returns posts instead
+        of comments). This method searches for posts matching the query, then fetches
+        top comments from each post to return actual comment bodies with text.
+        """
+        # Step 1: Search for relevant posts
+        post_limit = min(max(limit // 3, 3), 10)  # fetch 3-10 posts
+        post_result = self.search(
+            query, subreddit=subreddit, sort=sort,
+            time_filter=time_filter, limit=post_limit, after=after,
+        )
+        if "error" in post_result:
+            return post_result
+
+        posts = post_result.get("items", [])
+        if not posts:
+            return {"items": [], "after": None, "count": 0}
+
+        # Step 2: Fetch top comments from each post
+        comments_per_post = max(limit // len(posts), 2) if posts else limit
+        all_comments = []
+        for post in posts:
+            sub = post.get("subreddit", "")
+            post_id = post.get("id", "")
+            if not sub or not post_id:
+                continue
+            thread = self.post_comments(sub, post_id, sort="top", limit=comments_per_post)
+            if "error" in thread:
+                continue
+            for c in thread.get("comments", []):
+                # Attach post title for context
+                c["link_title"] = post.get("title", "")
+                all_comments.append(c)
+
+        # Sort by score and trim to requested limit
+        all_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
+        all_comments = all_comments[:limit]
+
+        return {
+            "items": all_comments,
+            "after": post_result.get("after"),
+            "count": len(all_comments),
         }
-        if after:
-            params["after"] = after
-
-        result = self._get(path, params)
-        return self._parse_listing(result, item_type="comment")
 
     # ── Subreddit Listings ────────────────────────────────
 

@@ -209,10 +209,21 @@ def test_search_in_subreddit():
 
 
 def test_search_comments():
+    """search_comments searches posts then fetches their top comments."""
     client = _make_client()
-    with patch.object(client.session, "get", return_value=_mock_response(SAMPLE_COMMENT_LISTING)) as mock_get:
+    # Mock both the post search and the post_comments fetch
+    post_thread_response = [
+        {"kind": "Listing", "data": {"children": [SAMPLE_POST]}},
+        {"kind": "Listing", "data": {"children": [SAMPLE_COMMENT]}},
+    ]
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(SAMPLE_LISTING),           # search() call
+            _mock_response(post_thread_response),      # post_comments() call
+        ]
         result = client.search_comments("great project")
-        assert mock_get.call_args[1]["params"]["type"] == "comment"
+        assert result["count"] >= 1
+        assert result["items"][0]["body"] == "This is a great project! Love the architecture."
 
 
 def test_subreddit_posts():
