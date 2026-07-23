@@ -73,7 +73,8 @@ reddit search "LLM" -m
 |---------|-------------|
 | `reddit posts <subreddit>` | Get posts (hot, new, top, rising, controversial) |
 | `reddit info <subreddit>` | Subreddit metadata (subscribers, description) |
-| `reddit thread <subreddit> <post_id>` | Post with full comment thread |
+| `reddit thread <subreddit> <post_id>` | Post with its comment tree (replies included) |
+| `reddit thread <url>` | Same, from a pasted permalink, redd.it link, t3_ fullname, or bare id |
 
 ### User
 
@@ -103,12 +104,20 @@ reddit search "LLM" -m
 | `-r, --subreddit` | Restrict search to a subreddit |
 | `-s, --sort` | Sort order (relevance, hot, top, new, comments, rising, controversial) |
 | `-t, --time` | Time filter (hour, day, week, month, year, all) |
-| `-n, --limit` | Max results (1-100, default: 25) |
+| `-n, --limit` | Max results (1-100, default: 25; `thread` allows up to 500) |
 | `--after` | Pagination cursor (from previous result) |
+| `--nsfw / --no-nsfw` | Include NSFW (over 18) results (default: hidden, with a note) |
 | `-j, --json-output` | Raw JSON output |
 | `-m, --markdown` | Markdown table output |
 | `--no-cache` | Disable response caching |
 | `--debug` | Enable debug logging |
+
+### Thread options
+
+| Flag | Description |
+|------|-------------|
+| `-d, --depth` | Max reply depth to descend (default: unlimited) |
+| `--no-expand` | Don't fetch "load more" comment stubs (fewer API calls) |
 
 ## Examples
 
@@ -122,8 +131,14 @@ reddit comments "ollama" -r LocalLLaMA
 # Find AI-related subreddits
 reddit find-subs "artificial intelligence"
 
-# Get a specific post's comment thread
+# Get a specific post's comment thread (replies indented)
 reddit thread programming abc123 --sort top
+
+# Or just paste a permalink
+reddit thread "https://reddit.com/r/programming/comments/abc123/some_title/"
+
+# Top-level comments only, no reply descent
+reddit thread programming abc123 --depth 0
 
 # User activity
 reddit user-posts spez -n 10

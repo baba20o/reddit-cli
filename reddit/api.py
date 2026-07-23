@@ -10,8 +10,9 @@ Docs: https://www.reddit.com/dev/api/
 import logging
 import os
 import random
+import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -49,13 +50,17 @@ def _retry_wait_seconds(attempt: int, response: requests.Response = None) -> flo
 
 
 def _format_post(post: dict) -> dict:
-    """Normalize a Reddit post/link into a clean dict."""
+    """Normalize a Reddit post/link into a clean dict.
+
+    Text fields arrive unescaped because every request sends raw_json=1;
+    without it Reddit HTML-escapes &, <, > in ALL string fields (even url).
+    """
     data = post.get("data", post)
     return {
         "id": data.get("id", ""),
         "name": data.get("name", ""),  # fullname e.g. t3_abc123
         "title": data.get("title", ""),
-        "author": data.get("author", "[deleted]"),
+        "author": data.get("author") or "[deleted]",
         "subreddit": data.get("subreddit", ""),
         "score": data.get("score", 0),
         "upvote_ratio": data.get("upvote_ratio", 0),
@@ -77,7 +82,7 @@ def _format_comment(comment: dict) -> dict:
     return {
         "id": data.get("id", ""),
         "name": data.get("name", ""),
-        "author": data.get("author", "[deleted]"),
+        "author": data.get("author") or "[deleted]",
         "body": data.get("body", ""),
         "score": data.get("score", 0),
         "subreddit": data.get("subreddit", ""),
@@ -86,22 +91,145 @@ def _format_comment(comment: dict) -> dict:
         "parent_id": data.get("parent_id", ""),
         "link_id": data.get("link_id", ""),
         "link_title": data.get("link_title", ""),
+        "depth": 0,
     }
 
 
 def _format_subreddit(sub: dict) -> dict:
     """Normalize a subreddit info dict."""
     data = sub.get("data", sub)
+    active = data.get("active_user_count")
+    if active is None:
+        active = data.get("accounts_active")  # legacy field; Reddit now returns null for both
     return {
         "name": data.get("display_name", ""),
         "title": data.get("title", ""),
         "description": data.get("public_description", ""),
         "subscribers": data.get("subscribers", 0),
-        "active_users": data.get("accounts_active", 0),
+        "active_users": active,
         "created_utc": data.get("created_utc", 0),
         "over_18": data.get("over18", False),
         "url": f"https://reddit.com{data.get('url', '')}",
     }
+
+
+def _filter_nsfw(parsed: dict, include_nsfw: bool) -> dict:
+    """Drop over_18 items unless requested; record how many were hidden."""
+    if include_nsfw or "error" in parsed:
+        return parsed
+    items = parsed.get("items", [])
+    kept = [i for i in items if not i.get("over_18")]
+    hidden = len(items) - len(kept)
+    if hidden:
+        parsed = {**parsed, "items": kept, "count": len(kept), "nsfw_hidden": hidden}
+    return parsed
+
+
+_POST_URL_RE = re.compile(r"(?:reddit\.com)?/r/(?P<sub>[^/\s]+)/comments/(?P<id>[a-zA-Z0-9]+)")
+# Slugless permalinks and gallery share links: reddit.com/comments/<id>, reddit.com/gallery/<id>
+_BARE_URL_RE = re.compile(r"reddit\.com/(?:comments|gallery)/(?P<id>[a-zA-Z0-9]+)")
+# Anchored so media hosts (v.redd.it, i.redd.it) don't false-match as shortlinks
+_SHORTLINK_RE = re.compile(r"(?<![.\w])redd\.it/(?P<id>[a-zA-Z0-9]+)")
+# Mobile-app share links; the token is opaque and only resolves via HTTP redirect
+_SHARE_LINK_RE = re.compile(r"reddit\.com/r/[^/\s]+/s/[A-Za-z0-9]+")
+
+
+def parse_post_reference(target: str, post_id: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Resolve (subreddit, post_id) from CLI-style arguments.
+
+    Accepts: subreddit + bare id, subreddit + t3_ fullname, a full permalink URL
+    (also slugless /comments/<id> and /gallery/<id> forms), a redd.it shortlink,
+    a t3_ fullname, or a bare post id. The subreddit may be None (Reddit
+    resolves /comments/{id} without one).
+    """
+
+    def _extract(ref: str):
+        ref = ref.strip()
+        if _SHARE_LINK_RE.search(ref):
+            raise ValueError(
+                f"{ref!r} is a mobile share link whose token only resolves via redirect — "
+                "open it in a browser and paste the full permalink instead"
+            )
+        m = _POST_URL_RE.search(ref)
+        if m:
+            return m.group("sub"), m.group("id").lower()
+        m = _BARE_URL_RE.search(ref) or _SHORTLINK_RE.search(ref)
+        if m:
+            return None, m.group("id").lower()
+        if ref.startswith("t3_"):
+            ref = ref[3:]
+        if re.fullmatch(r"[a-zA-Z0-9]+", ref):
+            return None, ref.lower()
+        return None, None
+
+    if post_id is None:
+        sub, pid = _extract(target)
+        if pid is None:
+            raise ValueError(
+                f"Cannot parse post reference {target!r} — expected a post URL, "
+                "a t3_ fullname, or a post id"
+            )
+        return sub, pid
+
+    sub, pid = _extract(post_id)
+    if pid is None:
+        raise ValueError(f"Cannot parse post id {post_id!r}")
+    return sub or target, pid
+
+
+def _extract_comment_tree(children: list, max_depth: Optional[int], depth: int = 0):
+    """Walk a nested comment listing. Returns (comments, more_ids, more_count).
+
+    Comments carry a `depth` field; `more_ids` are unexpanded comment ids from
+    "load more" stubs and `more_count` the number of comments they represent.
+    """
+    comments, more_ids, more_count = [], [], 0
+    for child in children:
+        kind = child.get("kind")
+        data = child.get("data", {})
+        if kind == "t1":
+            c = _format_comment(child)
+            c["depth"] = depth
+            comments.append(c)
+            replies = data.get("replies")
+            if isinstance(replies, dict) and (max_depth is None or depth < max_depth):
+                sub_children = replies.get("data", {}).get("children", [])
+                sc, si, sm = _extract_comment_tree(sub_children, max_depth, depth + 1)
+                comments.extend(sc)
+                more_ids.extend(si)
+                more_count += sm
+        elif kind == "more":
+            ids = data.get("children") or []
+            more_ids.extend(ids)
+            more_count += data.get("count") or len(ids)
+    return comments, more_ids, more_count
+
+
+def _sort_comment_tree(comments: list, link_fullname: str) -> list:
+    """Re-order a flat comment list into depth-first tree order.
+
+    Needed after /api/morechildren expansion, which returns comments flat and
+    appended out of tree order. Recomputes depth from actual parent links.
+    """
+    by_parent = {}
+    for c in comments:
+        by_parent.setdefault(c.get("parent_id") or "", []).append(c)
+
+    ordered = []
+
+    def visit(parent_name: str, depth: int):
+        for c in by_parent.get(parent_name, []):
+            c["depth"] = depth
+            ordered.append(c)
+            visit(c.get("name", ""), depth + 1)
+
+    visit(link_fullname, 0)
+
+    if len(ordered) < len(comments):
+        # Orphans: parents weren't fetched (e.g. remained in unexpanded "more" stubs)
+        seen = {c.get("name") for c in ordered}
+        ordered.extend(c for c in comments if c.get("name") not in seen)
+    return ordered
 
 
 class RedditClient:
@@ -183,6 +311,7 @@ class RedditClient:
         limit: int = 25,
         after: Optional[str] = None,
         search_type: str = "link",
+        include_nsfw: bool = False,
     ) -> dict:
         """Search Reddit posts.
 
@@ -194,6 +323,7 @@ class RedditClient:
             limit: Max results (1-100).
             after: Pagination cursor (fullname of last item).
             search_type: link (posts), sr (subreddits), user (users).
+            include_nsfw: Include over-18 results (default: excluded).
         """
         if subreddit:
             path = f"/r/{subreddit}/search"
@@ -207,12 +337,14 @@ class RedditClient:
             "limit": min(limit, 100),
             "type": search_type,
             "restrict_sr": "true" if subreddit else "false",
+            "include_over_18": "on" if include_nsfw else "off",
         }
         if after:
             params["after"] = after
 
         result = self._get(path, params)
-        return self._parse_listing(result, item_type=search_type)
+        # Server-side include_over_18 is advisory; filter client-side too
+        return _filter_nsfw(self._parse_listing(result, item_type=search_type), include_nsfw)
 
     def search_comments(
         self,
@@ -222,6 +354,7 @@ class RedditClient:
         time_filter: str = "all",
         limit: int = 25,
         after: Optional[str] = None,
+        include_nsfw: bool = False,
     ) -> dict:
         """Search Reddit comments by finding relevant posts and fetching their top comments.
 
@@ -234,13 +367,17 @@ class RedditClient:
         post_result = self.search(
             query, subreddit=subreddit, sort=sort,
             time_filter=time_filter, limit=post_limit, after=after,
+            include_nsfw=include_nsfw,
         )
         if "error" in post_result:
             return post_result
 
         posts = post_result.get("items", [])
         if not posts:
-            return {"items": [], "after": None, "count": 0}
+            empty = {"items": [], "after": post_result.get("after"), "count": 0}
+            if post_result.get("nsfw_hidden"):
+                empty["nsfw_hidden"] = post_result["nsfw_hidden"]
+            return empty
 
         # Step 2: Fetch top comments from each post
         comments_per_post = max(limit // len(posts), 2) if posts else limit
@@ -250,10 +387,15 @@ class RedditClient:
             post_id = post.get("id", "")
             if not sub or not post_id:
                 continue
-            thread = self.post_comments(sub, post_id, sort="top", limit=comments_per_post)
+            thread = self.post_comments(
+                sub, post_id, sort="top", limit=comments_per_post, expand_more=False,
+            )
             if "error" in thread:
                 continue
             for c in thread.get("comments", []):
+                # Skip deleted/removed/empty comments — useless as search results
+                if not c.get("body") or c["body"] in ("[deleted]", "[removed]"):
+                    continue
                 # Attach post title for context
                 c["link_title"] = post.get("title", "")
                 all_comments.append(c)
@@ -262,11 +404,14 @@ class RedditClient:
         all_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
         all_comments = all_comments[:limit]
 
-        return {
+        result = {
             "items": all_comments,
             "after": post_result.get("after"),
             "count": len(all_comments),
         }
+        if post_result.get("nsfw_hidden"):
+            result["nsfw_hidden"] = post_result["nsfw_hidden"]
+        return result
 
     # ── Subreddit Listings ────────────────────────────────
 
@@ -277,6 +422,7 @@ class RedditClient:
         time_filter: str = "all",
         limit: int = 25,
         after: Optional[str] = None,
+        include_nsfw: bool = False,
     ) -> dict:
         """Get posts from a subreddit.
 
@@ -285,6 +431,7 @@ class RedditClient:
             sort: hot, new, top, rising, controversial.
             time_filter: For top/controversial — hour, day, week, month, year, all.
             limit: Max results (1-100).
+            include_nsfw: Include over-18 results (default: excluded).
         """
         path = f"/r/{subreddit}/{sort}"
         params = {"limit": min(limit, 100), "t": time_filter}
@@ -292,7 +439,7 @@ class RedditClient:
             params["after"] = after
 
         result = self._get(path, params)
-        return self._parse_listing(result, item_type="link")
+        return _filter_nsfw(self._parse_listing(result, item_type="link"), include_nsfw)
 
     def subreddit_info(self, subreddit: str) -> dict:
         """Get subreddit metadata."""
@@ -305,20 +452,28 @@ class RedditClient:
 
     def post_comments(
         self,
-        subreddit: str,
+        subreddit: Optional[str],
         post_id: str,
         sort: str = "best",
         limit: int = 50,
+        max_depth: Optional[int] = None,
+        expand_more: bool = True,
     ) -> dict:
-        """Get comments for a specific post.
+        """Get a post with its comment tree (replies included, depth-first order).
 
         Args:
-            subreddit: Subreddit the post is in.
+            subreddit: Subreddit the post is in (None to resolve by id alone).
             post_id: Post ID (without t3_ prefix).
             sort: best, top, new, controversial, old, qa.
-            limit: Max comments to return.
+            limit: Max comments to return (including replies).
+            max_depth: Max reply depth to descend (None = unlimited).
+            expand_more: Fetch "load more" stubs via /api/morechildren until
+                `limit` is reached.
         """
-        path = f"/r/{subreddit}/comments/{post_id}"
+        if subreddit:
+            path = f"/r/{subreddit}/comments/{post_id}"
+        else:
+            path = f"/comments/{post_id}"
         params = {"sort": sort, "limit": limit}
 
         result = self._get(path, params)
@@ -326,19 +481,91 @@ class RedditClient:
             return result
 
         # Reddit returns [post_listing, comments_listing]
-        if isinstance(result, list) and len(result) >= 2:
-            post_data = result[0].get("data", {}).get("children", [])
-            comment_data = result[1].get("data", {}).get("children", [])
+        if not (isinstance(result, list) and len(result) >= 2):
+            return {"error": "Unexpected response format", "post": {}, "comments": []}
 
-            post = _format_post(post_data[0]) if post_data else {}
-            comments = []
-            for c in comment_data:
-                if c.get("kind") == "t1":
-                    comments.append(_format_comment(c))
+        post_data = result[0].get("data", {}).get("children", [])
+        comment_data = result[1].get("data", {}).get("children", [])
 
-            return {"post": post, "comments": comments, "total": len(comments)}
+        post = _format_post(post_data[0]) if post_data else {}
+        link_fullname = post.get("name") or f"t3_{post_id}"
 
-        return {"error": "Unexpected response format", "post": {}, "comments": []}
+        comments, more_ids, more_count = _extract_comment_tree(comment_data, max_depth)
+
+        # Expand "load more" stubs until we hit the requested limit
+        depth_by_name = {c["name"]: c.get("depth", 0) for c in comments}
+        excluded = set()  # names dropped by max_depth or missing parents
+        expansions = 0
+        while expand_more and more_ids and len(comments) < limit and expansions < 20:
+            expansions += 1
+            batch, more_ids = more_ids[:100], more_ids[100:]
+            more_result = self._get("/api/morechildren", {
+                "api_type": "json",
+                "link_id": link_fullname,
+                "children": ",".join(batch),
+                "sort": sort,
+            })
+            if "error" in more_result:
+                break
+            things = more_result.get("json", {}).get("data", {}).get("things", []) or []
+            for thing in things:
+                if thing.get("kind") == "more":
+                    # Nested stub: queue its ids for later batches but do NOT add
+                    # its count — the original stub's count already covered it
+                    more_ids.extend(thing.get("data", {}).get("children") or [])
+
+            # Stitch t1 things, iterating to a fixpoint so children can resolve
+            # even when they arrive before their parent within the batch
+            pending = [t for t in things if t.get("kind") == "t1"]
+            new_count = 0
+            progress = True
+            while pending and progress:
+                progress = False
+                unresolved = []
+                for thing in pending:
+                    data = thing.get("data", {})
+                    name = data.get("name", "")
+                    parent = data.get("parent_id", "")
+                    if parent == link_fullname:
+                        depth = 0
+                    elif parent in depth_by_name:
+                        depth = depth_by_name[parent] + 1
+                    elif parent in excluded:
+                        excluded.add(name)
+                        progress = True
+                        continue
+                    else:
+                        unresolved.append(thing)
+                        continue
+                    progress = True
+                    if max_depth is not None and depth > max_depth:
+                        excluded.add(name)
+                        continue
+                    c = _format_comment(thing)
+                    c["depth"] = depth
+                    depth_by_name[name] = depth
+                    comments.append(c)
+                    new_count += 1
+                pending = unresolved
+            # Leftover unresolved comments have parents that never arrived
+            # (e.g. still in unexpanded stubs) — drop them; they stay in
+            # more_count as "not fetched" rather than render as fake top-levels
+            excluded.update(t.get("data", {}).get("name", "") for t in pending)
+
+            more_count = max(0, more_count - new_count)
+            if new_count == 0:
+                break
+
+        comments = _sort_comment_tree(comments, link_fullname)
+        truncated = max(0, len(comments) - limit)
+        comments = comments[:limit]
+
+        return {
+            "post": post,
+            "comments": comments,
+            "total": len(comments),
+            "more_count": more_count + truncated,
+        }
 
     # ── User ──────────────────────────────────────────────
 
@@ -365,6 +592,7 @@ class RedditClient:
         time_filter: str = "all",
         limit: int = 25,
         after: Optional[str] = None,
+        include_nsfw: bool = False,
     ) -> dict:
         """Get a user's submitted posts."""
         path = f"/user/{username}/submitted"
@@ -372,7 +600,7 @@ class RedditClient:
         if after:
             params["after"] = after
         result = self._get(path, params)
-        return self._parse_listing(result, item_type="link")
+        return _filter_nsfw(self._parse_listing(result, item_type="link"), include_nsfw)
 
     def user_comments(
         self,
@@ -397,19 +625,25 @@ class RedditClient:
         query: str,
         limit: int = 25,
         after: Optional[str] = None,
+        include_nsfw: bool = False,
     ) -> dict:
         """Search for subreddits by name/description."""
-        params = {"q": query, "limit": min(limit, 100), "type": "sr"}
+        params = {
+            "q": query,
+            "limit": min(limit, 100),
+            "type": "sr",
+            "include_over_18": "on" if include_nsfw else "off",
+        }
         if after:
             params["after"] = after
 
         result = self._get("/search", params)
-        return self._parse_listing(result, item_type="sr")
+        return _filter_nsfw(self._parse_listing(result, item_type="sr"), include_nsfw)
 
-    def popular_subreddits(self, limit: int = 25) -> dict:
+    def popular_subreddits(self, limit: int = 25, include_nsfw: bool = False) -> dict:
         """Get popular subreddits."""
         result = self._get("/subreddits/popular", {"limit": min(limit, 100)})
-        return self._parse_listing(result, item_type="sr")
+        return _filter_nsfw(self._parse_listing(result, item_type="sr"), include_nsfw)
 
     # ── Trending / Popular ────────────────────────────────
 
@@ -417,13 +651,14 @@ class RedditClient:
         self,
         limit: int = 25,
         after: Optional[str] = None,
+        include_nsfw: bool = False,
     ) -> dict:
         """Get posts from r/popular (cross-subreddit trending)."""
         params = {"limit": min(limit, 100)}
         if after:
             params["after"] = after
         result = self._get("/r/popular/hot", params)
-        return self._parse_listing(result, item_type="link")
+        return _filter_nsfw(self._parse_listing(result, item_type="link"), include_nsfw)
 
     # ── Internal ──────────────────────────────────────────
 
@@ -459,6 +694,8 @@ class RedditClient:
         """Execute an API GET with auth, caching, and rate limiting."""
         self._ensure_token()
         url = f"{OAUTH_URL}{path}"
+        # Without raw_json=1 Reddit HTML-escapes &, <, > in every string field
+        params = {**params, "raw_json": 1}
         cache_params = {k: str(v) for k, v in params.items()}
 
         if self.use_cache and self.cache:
