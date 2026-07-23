@@ -33,6 +33,16 @@ REQUEST_TIMEOUT = 30
 SORT_CHOICES = ("hot", "new", "top", "rising", "controversial", "best")
 TIME_CHOICES = ("hour", "day", "week", "month", "year", "all")
 
+# Function words that would make comment-search term matching meaningless
+_SEARCH_STOPWORDS = frozenset("""
+    the and for you your yours what this that with are was were how who whom
+    when where why can could does did doing not but all any has have had having
+    its it's out get got just like some them they their there then than too
+    very will would should about into from over under after before while being
+    been because though although which whose these those such only also more
+    most much many each other another between against
+""".split())
+
 
 def _retry_wait_seconds(attempt: int, response: requests.Response = None) -> float:
     """Calculate retry wait with exponential backoff + jitter."""
@@ -56,18 +66,20 @@ def _format_post(post: dict) -> dict:
     without it Reddit HTML-escapes &, <, > in ALL string fields (even url).
     """
     data = post.get("data", post)
+    # `or 0` throughout: Reddit returns explicit nulls for numeric fields at
+    # times, and .get() defaults don't catch those (crashes ":,"-formatting)
     return {
         "id": data.get("id", ""),
         "name": data.get("name", ""),  # fullname e.g. t3_abc123
         "title": data.get("title", ""),
         "author": data.get("author") or "[deleted]",
         "subreddit": data.get("subreddit", ""),
-        "score": data.get("score", 0),
-        "upvote_ratio": data.get("upvote_ratio", 0),
-        "num_comments": data.get("num_comments", 0),
+        "score": data.get("score") or 0,
+        "upvote_ratio": data.get("upvote_ratio") or 0,
+        "num_comments": data.get("num_comments") or 0,
         "url": data.get("url", ""),
         "selftext": data.get("selftext", ""),
-        "created_utc": data.get("created_utc", 0),
+        "created_utc": data.get("created_utc") or 0,
         "permalink": f"https://reddit.com{data.get('permalink', '')}",
         "is_self": data.get("is_self", False),
         "link_flair_text": data.get("link_flair_text") or "",
@@ -84,13 +96,15 @@ def _format_comment(comment: dict) -> dict:
         "name": data.get("name", ""),
         "author": data.get("author") or "[deleted]",
         "body": data.get("body", ""),
-        "score": data.get("score", 0),
+        "score": data.get("score") or 0,
         "subreddit": data.get("subreddit", ""),
-        "created_utc": data.get("created_utc", 0),
+        "created_utc": data.get("created_utc") or 0,
         "permalink": f"https://reddit.com{data.get('permalink', '')}",
         "parent_id": data.get("parent_id", ""),
         "link_id": data.get("link_id", ""),
         "link_title": data.get("link_title", ""),
+        "stickied": data.get("stickied", False),
+        "distinguished": data.get("distinguished") or "",  # moderator/admin
         "depth": 0,
     }
 
@@ -105,9 +119,9 @@ def _format_subreddit(sub: dict) -> dict:
         "name": data.get("display_name", ""),
         "title": data.get("title", ""),
         "description": data.get("public_description", ""),
-        "subscribers": data.get("subscribers", 0),
+        "subscribers": data.get("subscribers") or 0,  # explicit null for some subs
         "active_users": active,
-        "created_utc": data.get("created_utc", 0),
+        "created_utc": data.get("created_utc") or 0,
         "over_18": data.get("over18", False),
         "url": f"https://reddit.com{data.get('url', '')}",
     }
@@ -218,7 +232,12 @@ def _sort_comment_tree(comments: list, link_fullname: str) -> list:
     ordered = []
 
     def visit(parent_name: str, depth: int):
-        for c in by_parent.get(parent_name, []):
+        children = by_parent.get(parent_name, [])
+        if depth == 0:
+            # Stickied comments (bot/mod promos) last so they don't eat top slots
+            children = ([c for c in children if not c.get("stickied")]
+                        + [c for c in children if c.get("stickied")])
+        for c in children:
             c["depth"] = depth
             ordered.append(c)
             visit(c.get("name", ""), depth + 1)
@@ -393,15 +412,29 @@ class RedditClient:
             if "error" in thread:
                 continue
             for c in thread.get("comments", []):
-                # Skip deleted/removed/empty comments — useless as search results
+                # Skip deleted/removed/empty and stickied (bot/mod) comments —
+                # useless as search results
                 if not c.get("body") or c["body"] in ("[deleted]", "[removed]"):
+                    continue
+                if c.get("stickied"):
                     continue
                 # Attach post title for context
                 c["link_title"] = post.get("title", "")
                 all_comments.append(c)
 
-        # Sort by score and trim to requested limit
-        all_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
+        # Rank comments that actually mention the query terms first, then by
+        # score — post relevance alone surfaces generic top comments.
+        # Stopwords are dropped and matches are whole-word, otherwise function
+        # words ("what", "you") match everything and the boost is meaningless.
+        terms = [t for t in re.findall(r"\w+", query.lower())
+                 if len(t) > 2 and t not in _SEARCH_STOPWORDS]
+        patterns = [re.compile(rf"\b{re.escape(t)}\b") for t in terms]
+
+        def _matches(c):
+            body = c.get("body", "").lower()
+            return sum(1 for p in patterns if p.search(body))
+
+        all_comments.sort(key=lambda c: (_matches(c) > 0, c.get("score", 0)), reverse=True)
         all_comments = all_comments[:limit]
 
         result = {
@@ -475,6 +508,10 @@ class RedditClient:
         else:
             path = f"/comments/{post_id}"
         params = {"sort": sort, "limit": limit}
+        if max_depth is not None:
+            # Ask Reddit to prune the tree server-side; its `limit` counts whole
+            # trees, so without this a depth-filtered request comes back underfull
+            params["depth"] = max_depth + 1
 
         result = self._get(path, params)
         if "error" in result:
@@ -560,11 +597,20 @@ class RedditClient:
         truncated = max(0, len(comments) - limit)
         comments = comments[:limit]
 
+        remaining = more_count + truncated
+        # Reddit's stub counts are fuzzy and can overstate; clamp to the post's
+        # own comment total when we have it. Floor at `truncated`: those were
+        # actually fetched and cut, so at least that many provably remain even
+        # if num_comments is stale-low.
+        num_comments = post.get("num_comments")
+        if isinstance(num_comments, int) and num_comments > 0:
+            remaining = max(truncated, min(remaining, max(0, num_comments - len(comments))))
+
         return {
             "post": post,
             "comments": comments,
             "total": len(comments),
-            "more_count": more_count + truncated,
+            "more_count": remaining,
         }
 
     # ── User ──────────────────────────────────────────────
@@ -577,10 +623,10 @@ class RedditClient:
         data = result.get("data", result)
         return {
             "username": data.get("name", ""),
-            "link_karma": data.get("link_karma", 0),
-            "comment_karma": data.get("comment_karma", 0),
-            "total_karma": data.get("total_karma", 0),
-            "created_utc": data.get("created_utc", 0),
+            "link_karma": data.get("link_karma") or 0,
+            "comment_karma": data.get("comment_karma") or 0,
+            "total_karma": data.get("total_karma") or 0,
+            "created_utc": data.get("created_utc") or 0,
             "is_gold": data.get("is_gold", False),
             "verified": data.get("verified", False),
         }

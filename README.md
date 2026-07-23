@@ -109,8 +109,12 @@ reddit search "LLM" -m
 | `--nsfw / --no-nsfw` | Include NSFW (over 18) results (default: hidden, with a note) |
 | `-j, --json-output` | Raw JSON output |
 | `-m, --markdown` | Markdown table output |
-| `--no-cache` | Disable response caching |
-| `--debug` | Enable debug logging |
+| `--no-cache` | Disable response caching (works before or after the subcommand) |
+| `--debug` | Enable debug logging (works before or after the subcommand) |
+
+Stickied (bot/mod) comments are demoted to the end of thread output and marked
+`[pinned]`; comment search skips them and ranks comments mentioning your query
+terms first.
 
 ### Thread options
 

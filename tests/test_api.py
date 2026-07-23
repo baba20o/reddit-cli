@@ -442,6 +442,152 @@ def test_format_subreddit_active_users_none_when_unreported():
     assert _format_subreddit({"kind": "t5", "data": data})["active_users"] is None
 
 
+# ── Null numeric fields (R1) ──────────────────────────────
+
+
+def test_formatters_coerce_explicit_nulls():
+    """Reddit returns explicit nulls (e.g. r/StableLM subscribers) — must not
+    crash ':,'-formatting downstream."""
+    sub = {"kind": "t5", "data": {**SAMPLE_SUBREDDIT["data"], "subscribers": None,
+           "created_utc": None}}
+    assert _format_subreddit(sub)["subscribers"] == 0
+
+    post = {"kind": "t3", "data": {**SAMPLE_POST["data"], "score": None,
+            "num_comments": None, "upvote_ratio": None, "created_utc": None}}
+    fp = _format_post(post)
+    assert (fp["score"], fp["num_comments"], fp["upvote_ratio"], fp["created_utc"]) == (0, 0, 0, 0)
+
+    comment = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "score": None,
+               "created_utc": None}}
+    fc = _format_comment(comment)
+    assert (fc["score"], fc["created_utc"]) == (0, 0)
+
+
+# ── Stickied comments (R2) ────────────────────────────────
+
+
+def test_format_comment_captures_stickied():
+    comment = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "stickied": True,
+               "distinguished": "moderator"}}
+    fc = _format_comment(comment)
+    assert fc["stickied"] is True
+    assert fc["distinguished"] == "moderator"
+
+
+def test_sort_comment_tree_demotes_stickied_top_levels():
+    pinned = {"name": "t1_bot", "parent_id": "t3_link", "stickied": True}
+    normal = {"name": "t1_real", "parent_id": "t3_link", "stickied": False}
+    ordered = _sort_comment_tree([pinned, normal], "t3_link")
+    assert [c["name"] for c in ordered] == ["t1_real", "t1_bot"]
+
+
+def test_search_comments_skips_stickied():
+    client = _make_client()
+    bot = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": "bot1",
+           "name": "t1_bot1", "body": "Join our Discord!", "stickied": True}}
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [SAMPLE_POST]}},
+        {"kind": "Listing", "data": {"children": [bot, SAMPLE_COMMENT]}},
+    ]
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(SAMPLE_LISTING),
+            _mock_response(thread_response),
+        ]
+        result = client.search_comments("great project")
+        assert all(not c.get("stickied") for c in result["items"])
+        assert all("Discord" not in c["body"] for c in result["items"])
+
+
+# ── Depth param + relevance ranking (R3, R4) ──────────────
+
+
+def test_post_comments_passes_depth_param():
+    client = _make_client()
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [SAMPLE_POST]}},
+        {"kind": "Listing", "data": {"children": [SAMPLE_COMMENT]}},
+    ]
+    with patch.object(client.session, "get", return_value=_mock_response(thread_response)) as mock_get:
+        client.post_comments("programming", "abc123", max_depth=0)
+        assert mock_get.call_args[1]["params"]["depth"] == 1
+        client.post_comments("programming", "abc123")
+        assert "depth" not in mock_get.call_args[1]["params"]
+
+
+def test_search_comments_ranking_ignores_stopwords_and_substrings():
+    """'you' must not match 'your'; 'what/do/you' must not neutralize ranking."""
+    client = _make_client()
+    generic = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": "g1",
+               "name": "t1_g1", "body": "Thanks for sharing your work!", "score": 900}}
+    on_topic = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": "t2x",
+                "name": "t1_t2x", "body": "I run Mistral locally on a 3090.", "score": 5}}
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [SAMPLE_POST]}},
+        {"kind": "Listing", "data": {"children": [generic, on_topic]}},
+    ]
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(SAMPLE_LISTING),
+            _mock_response(thread_response),
+        ]
+        result = client.search_comments("what do you run locally")
+        assert result["items"][0]["body"].startswith("I run Mistral")
+
+
+def test_more_count_floors_at_truncated():
+    """num_comments stale-low must not hide provably-remaining comments."""
+    client = _make_client()
+    extra = [{"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": f"c{i}",
+              "name": f"t1_c{i}"}} for i in range(5)]
+    post = {"kind": "t3", "data": {**SAMPLE_POST["data"], "num_comments": 3}}
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [post]}},
+        {"kind": "Listing", "data": {"children": extra}},
+    ]
+    with patch.object(client.session, "get", return_value=_mock_response(thread_response)):
+        result = client.post_comments("programming", "abc123", limit=3, expand_more=False)
+        # 5 fetched, 2 cut by limit -> at least 2 remain even though 3-3=0
+        assert result["more_count"] == 2
+
+
+def test_search_comments_ranks_matching_bodies_first():
+    client = _make_client()
+    generic = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": "g1",
+               "name": "t1_g1", "body": "Nice post, thanks for sharing!", "score": 900}}
+    on_topic = {"kind": "t1", "data": {**SAMPLE_COMMENT["data"], "id": "t1x",
+                "name": "t1_t1x", "body": "For ollama setups I run quantized models.", "score": 5}}
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [SAMPLE_POST]}},
+        {"kind": "Listing", "data": {"children": [generic, on_topic]}},
+    ]
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(SAMPLE_LISTING),
+            _mock_response(thread_response),
+        ]
+        result = client.search_comments("ollama setups")
+        bodies = [c["body"] for c in result["items"]]
+        assert bodies[0].startswith("For ollama")
+
+
+# ── more_count clamp (R7) ─────────────────────────────────
+
+
+def test_more_count_clamped_to_num_comments():
+    client = _make_client()
+    # Stub claims 500 remain but the post only has 10 comments total
+    more_stub = {"kind": "more", "data": {"children": [], "count": 500}}
+    post = {"kind": "t3", "data": {**SAMPLE_POST["data"], "num_comments": 10}}
+    thread_response = [
+        {"kind": "Listing", "data": {"children": [post]}},
+        {"kind": "Listing", "data": {"children": [SAMPLE_COMMENT, more_stub]}},
+    ]
+    with patch.object(client.session, "get", return_value=_mock_response(thread_response)):
+        result = client.post_comments("programming", "abc123", expand_more=False)
+        assert result["more_count"] == 9  # 10 total - 1 shown
+
+
 # ── NSFW filtering (rough edge #4) ────────────────────────
 
 

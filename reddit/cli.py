@@ -2,8 +2,10 @@
 
 import json
 import logging
+import re
 import textwrap
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import click
 from rich.console import Console
@@ -21,6 +23,23 @@ NSFW_FLAG = click.option(
     "--nsfw/--no-nsfw", "include_nsfw", default=False, show_default=True,
     help="Include NSFW (over 18) results",
 )
+
+
+def common_options(f):
+    """--no-cache/--debug on every command, so position doesn't matter."""
+    f = click.option("--no-cache", "no_cache", is_flag=True,
+                     help="Disable response caching")(f)
+    f = click.option("--debug", "debug", is_flag=True,
+                     help="Enable debug logging")(f)
+    return f
+
+
+def _client(ctx, no_cache: bool = False, debug: bool = False) -> "RedditClient":
+    """Build the API client, honoring group-level and command-level flags."""
+    if debug or ctx.obj.get("debug"):
+        logging.getLogger().setLevel(logging.DEBUG)
+    use_cache = not (no_cache or ctx.obj.get("no_cache"))
+    return RedditClient(use_cache=use_cache)
 
 
 def _error_exit(result: dict) -> bool:
@@ -71,6 +90,29 @@ def _md_link(text: str, url: str) -> str:
 def _nsfw_hidden_note(result: dict) -> str:
     hidden = result.get("nsfw_hidden", 0)
     return f"{hidden} NSFW result(s) hidden — use --nsfw to include" if hidden else ""
+
+
+_URL_ONLY_RE = re.compile(r"https?://\S+")
+
+SELFTEXT_PREVIEW = 500   # chars of post text shown in thread view
+SELFTEXT_SLACK = 200     # don't truncate if the overflow is smaller than this
+
+
+def _url_host(url: str) -> str:
+    try:
+        return urlparse(url).netloc or "link"
+    except ValueError:  # e.g. brackets in a botched paste -> "Invalid IPv6 URL"
+        return "link"
+
+
+def _comment_snippet(body: str, width: int) -> str:
+    """One-line comment preview; bare link/image comments become a short tag."""
+    body = (body or "").strip()
+    if not body:
+        return "(no text)"
+    if _URL_ONLY_RE.fullmatch(body):
+        return f"(link: {_url_host(body)})"
+    return textwrap.shorten(body.replace("\n", " "), width=max(40, width), placeholder="...") or "(no text)"
 
 
 # ── Renderers ─────────────────────────────────────────────
@@ -142,6 +184,9 @@ def _render_posts_markdown(result: dict, title: str) -> None:
     hidden_note = _nsfw_hidden_note(result)
     if hidden_note:
         click.echo(f"\n_{hidden_note}_")
+    after = result.get("after")
+    if after:
+        click.echo(f"\n_Next page: `--after {after}`_")
 
 
 def _render_comments(result: dict, title: str) -> None:
@@ -157,7 +202,14 @@ def _render_comments(result: dict, title: str) -> None:
 
     for item in items:
         body = item.get("body", "")
-        snippet = escape(textwrap.fill(body[:300], width=100)) if body else "[dim](no text — deleted or empty)[/dim]"
+        if not body:
+            snippet = "[dim](no text — deleted or empty)[/dim]"
+        elif _URL_ONLY_RE.fullmatch(body.strip()):
+            snippet = escape(_comment_snippet(body, 100))
+        else:
+            # Word-boundary shorten (no mid-word "for tax reaso" chops)
+            preview = textwrap.shorten(body, width=300, placeholder=" …")
+            snippet = escape(textwrap.fill(preview, width=100))
         link_title = item.get("link_title") or ""
         sub = item.get("subreddit", "")
         header = (
@@ -216,7 +268,8 @@ def _render_subreddits(result: dict, title: str) -> None:
             name,
             escape(item.get("title", "").replace("\n", " ")),
             f"{item.get('subscribers', 0):,}",
-            escape(item.get("description", "").replace("\n", " ")),
+            # Cap: some sub descriptions balloon rows to 9+ lines; full text in `info`/-j
+            escape(_truncate(item.get("description", ""), 160)),
         )
 
     console.print(table)
@@ -316,20 +369,30 @@ def _render_post_detail(data: dict) -> None:
 
     selftext = post.get("selftext", "")
     if selftext:
-        lines.append(f"\n[bold]Text:[/bold]\n{escape(selftext[:500])}")
+        # Slack margin: don't chop a post that barely overflows the preview cap
+        if len(selftext) <= SELFTEXT_PREVIEW + SELFTEXT_SLACK:
+            lines.append(f"\n[bold]Text:[/bold]\n{escape(selftext)}")
+        else:
+            shown = selftext[:SELFTEXT_PREVIEW]
+            lines.append(
+                f"\n[bold]Text:[/bold]\n{escape(shown)}"
+                f"\n[dim]… truncated ({len(selftext) - SELFTEXT_PREVIEW} more chars — use -j for full text)[/dim]"
+            )
 
     console.print(Panel("\n".join(lines), title="Post Details", expand=False))
 
     if comments:
+        op = post.get("author", "")
         console.print(f"\n[bold]{len(comments)} comments (replies indented):[/bold]\n")
         for c in comments:
             depth = c.get("depth", 0)
             indent = "  " * depth
             author = c.get("author") or "[deleted]"
-            body = c.get("body", "").replace("\n", " ")
-            snippet = textwrap.shorten(body, width=max(40, 120 - 2 * depth), placeholder="...") or "(no text)"
+            snippet = _comment_snippet(c.get("body", ""), 120 - 2 * depth)
             score = c.get("score", 0)
-            console.print(f"  {indent}[green]{escape(author)}[/green] ({score} pts): {escape(snippet)}")
+            pin = "[dim]\\[pinned][/dim] " if c.get("stickied") else ""
+            op_tag = " [cyan]\\[OP][/cyan]" if op and author == op and author != "[deleted]" else ""
+            console.print(f"  {indent}{pin}[green]{escape(author)}[/green]{op_tag} ({score} pts): {escape(snippet)}")
 
     more = data.get("more_count", 0)
     if more:
@@ -353,16 +416,27 @@ def _render_post_detail_markdown(data: dict) -> None:
 
     selftext = post.get("selftext", "")
     if selftext:
-        click.echo(f"\n### Text\n{selftext[:500]}")
+        if len(selftext) <= SELFTEXT_PREVIEW + SELFTEXT_SLACK:
+            click.echo(f"\n### Text\n{selftext}")
+        else:
+            click.echo(f"\n### Text\n{selftext[:SELFTEXT_PREVIEW]}")
+            click.echo(f"\n_… truncated ({len(selftext) - SELFTEXT_PREVIEW} more chars — use -j for full text)_")
 
     if comments:
+        op = post.get("author", "")
         click.echo(f"\n### Comments ({len(comments)} fetched, replies nested)\n")
         for c in comments:
             indent = "  " * c.get("depth", 0)
             author = c.get("author") or "[deleted]"
-            body = _escape_md(c.get("body", ""))
-            snippet = textwrap.shorten(body, width=120, placeholder="...") or "(no text)"
-            click.echo(f"{indent}- **{_escape_md(author)}** ({c.get('score', 0)} pts): {snippet}")
+            body = (c.get("body") or "").strip()
+            if body and _URL_ONLY_RE.fullmatch(body):
+                # Keep the URL clickable in markdown instead of a lossy host tag
+                snippet = f"[link: {_url_host(body)}]({body})"
+            else:
+                snippet = _escape_md(_comment_snippet(body, 120))
+            pin = "*(pinned)* " if c.get("stickied") else ""
+            op_tag = " *(OP)*" if op and author == op and author != "[deleted]" else ""
+            click.echo(f"{indent}- {pin}**{_escape_md(author)}**{op_tag} ({c.get('score', 0)} pts): {snippet}")
 
     more = data.get("more_count", 0)
     if more:
@@ -380,7 +454,8 @@ def main(ctx, debug, no_cache):
     """reddit — Reddit search and community intelligence tool (OAuth2 API)."""
     logging.basicConfig(level=logging.DEBUG if debug else logging.WARNING)
     ctx.ensure_object(dict)
-    ctx.obj["client"] = RedditClient(use_cache=not no_cache)
+    ctx.obj["debug"] = debug
+    ctx.obj["no_cache"] = no_cache
 
 
 @main.command()
@@ -393,10 +468,11 @@ def main(ctx, debug, no_cache):
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")
 @click.option("--markdown", "-m", is_flag=True, help="Output as markdown")
+@common_options
 @click.pass_context
-def search(ctx, query, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown):
+def search(ctx, query, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown, no_cache, debug):
     """Search Reddit posts."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.search(query, subreddit=subreddit, sort=sort, time_filter=time_filter,
                           limit=limit, after=after, include_nsfw=include_nsfw)
     if _error_exit(result):
@@ -414,10 +490,11 @@ def search(ctx, query, subreddit, sort, time_filter, limit, after, include_nsfw,
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown):
+def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown, no_cache, debug):
     """Search Reddit comments."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.search_comments(query, subreddit=subreddit, sort=sort,
                                     time_filter=time_filter, limit=limit, after=after,
                                     include_nsfw=include_nsfw)
@@ -440,10 +517,11 @@ def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, include
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def posts(ctx, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown):
+def posts(ctx, subreddit, sort, time_filter, limit, after, include_nsfw, json_output, markdown, no_cache, debug):
     """Get posts from a subreddit (hot, new, top, rising, controversial)."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.subreddit_posts(subreddit, sort=sort, time_filter=time_filter,
                                     limit=limit, after=after, include_nsfw=include_nsfw)
     if _error_exit(result):
@@ -455,10 +533,11 @@ def posts(ctx, subreddit, sort, time_filter, limit, after, include_nsfw, json_ou
 @click.argument("subreddit")
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def info(ctx, subreddit, json_output, markdown):
+def info(ctx, subreddit, json_output, markdown, no_cache, debug):
     """Get subreddit metadata (subscribers, description, etc.)."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.subreddit_info(subreddit)
     if _error_exit(result):
         return
@@ -481,8 +560,9 @@ def info(ctx, subreddit, json_output, markdown):
 @click.option("--no-expand", is_flag=True, help="Don't fetch 'load more' comment stubs")
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def thread(ctx, target, post_id, sort, limit, depth, no_expand, json_output, markdown):
+def thread(ctx, target, post_id, sort, limit, depth, no_expand, json_output, markdown, no_cache, debug):
     """Get a post with its comment thread.
 
     TARGET is a subreddit (with POST_ID as second argument), or a full post
@@ -494,7 +574,7 @@ def thread(ctx, target, post_id, sort, limit, depth, no_expand, json_output, mar
       reddit thread https://reddit.com/r/programming/comments/abc123/some_title/
       reddit thread t3_abc123
     """
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     try:
         subreddit, pid = parse_post_reference(target, post_id)
     except ValueError as e:
@@ -516,10 +596,11 @@ def thread(ctx, target, post_id, sort, limit, depth, no_expand, json_output, mar
 @click.argument("username")
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def user(ctx, username, json_output, markdown):
+def user(ctx, username, json_output, markdown, no_cache, debug):
     """Get user profile."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.user_about(username)
     if _error_exit(result):
         return
@@ -540,10 +621,11 @@ def user(ctx, username, json_output, markdown):
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def user_posts(ctx, username, sort, time_filter, limit, include_nsfw, json_output, markdown):
+def user_posts(ctx, username, sort, time_filter, limit, include_nsfw, json_output, markdown, no_cache, debug):
     """Get a user's submitted posts."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.user_posts(username, sort=sort, time_filter=time_filter, limit=limit,
                                include_nsfw=include_nsfw)
     if _error_exit(result):
@@ -559,10 +641,11 @@ def user_posts(ctx, username, sort, time_filter, limit, include_nsfw, json_outpu
 @click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True)
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def user_comments(ctx, username, sort, time_filter, limit, json_output, markdown):
+def user_comments(ctx, username, sort, time_filter, limit, json_output, markdown, no_cache, debug):
     """Get a user's comments."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.user_comments(username, sort=sort, time_filter=time_filter, limit=limit)
     if _error_exit(result):
         return
@@ -580,10 +663,11 @@ def user_comments(ctx, username, sort, time_filter, limit, json_output, markdown
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def find_subs(ctx, query, limit, include_nsfw, json_output, markdown):
+def find_subs(ctx, query, limit, include_nsfw, json_output, markdown, no_cache, debug):
     """Search for subreddits by name/description."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.search_subreddits(query, limit=limit, include_nsfw=include_nsfw)
     if _error_exit(result):
         return
@@ -600,10 +684,11 @@ def find_subs(ctx, query, limit, include_nsfw, json_output, markdown):
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def popular(ctx, limit, include_nsfw, json_output, markdown):
+def popular(ctx, limit, include_nsfw, json_output, markdown, no_cache, debug):
     """Get popular posts from across Reddit."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.popular_posts(limit=limit, include_nsfw=include_nsfw)
     if _error_exit(result):
         return
@@ -615,10 +700,11 @@ def popular(ctx, limit, include_nsfw, json_output, markdown):
 @NSFW_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
+@common_options
 @click.pass_context
-def popular_subs(ctx, limit, include_nsfw, json_output, markdown):
+def popular_subs(ctx, limit, include_nsfw, json_output, markdown, no_cache, debug):
     """Get popular subreddits."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     result = client.popular_subreddits(limit=limit, include_nsfw=include_nsfw)
     if _error_exit(result):
         return
@@ -631,10 +717,11 @@ def popular_subs(ctx, limit, include_nsfw, json_output, markdown):
 
 
 @main.command(name="clear-cache")
+@common_options
 @click.pass_context
-def clear_cache(ctx):
+def clear_cache(ctx, no_cache, debug):
     """Clear local response cache."""
-    client = ctx.obj["client"]
+    client = _client(ctx, no_cache, debug)
     if not client.cache:
         console.print("[yellow]Cache is disabled for this run (--no-cache).[/yellow]")
         return
