@@ -313,15 +313,15 @@ def test_seen_store_atomic_save(tmp_path):
 def test_thread_filtered_view_flat_and_counted():
     """Filtered thread view must not indent by orphaned depth."""
     result, _ = _invoke(["thread", "s", "abc123", "--author", "op_user"], _thread_client())
-    assert "filtered view" in result.output
-    assert "1 hidden" in result.output
+    assert "flat view" in result.output
+    assert "1 filtered out" in result.output
     # depth-2 comment renders flat (2 leading spaces from the base indent only)
     assert "\n      " not in result.output.split("comments")[1][:400]
 
 
 def test_thread_all_filtered_shows_note():
     result, _ = _invoke(["thread", "s", "abc123", "--author", "nobody_matches"], _thread_client())
-    assert "No comments matched the filters" in result.output
+    assert "No comments to show" in result.output
     assert "3 filtered out" in result.output
 
 

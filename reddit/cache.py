@@ -68,7 +68,7 @@ class SeenStore:
 
     def _load(self) -> dict:
         try:
-            return json.loads(self.path.read_text())
+            return json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
 
@@ -76,7 +76,7 @@ class SeenStore:
         # Atomic replace: a crash mid-write must not wipe every store
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
+        tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(self.path)
 
     def filter_new(self, name: str, items: list) -> list:

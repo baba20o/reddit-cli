@@ -1,13 +1,16 @@
 """CLI entry point for Reddit search via OAuth2 API."""
 
+import contextlib
+import io
 import json
 import logging
+import os
 import re
 import textwrap
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
 import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 from rich.console import Console
@@ -17,6 +20,7 @@ from rich.table import Table
 
 from reddit.api import RedditClient, SORT_CHOICES, TIME_CHOICES, parse_post_reference
 from reddit.cache import SeenStore
+from reddit.topics import TopicStore
 
 console = Console()
 
@@ -234,6 +238,83 @@ _URL_ONLY_RE = re.compile(r"https?://\S+")
 
 SELFTEXT_PREVIEW = 500   # chars of post text shown in thread view
 SELFTEXT_SLACK = 200     # don't truncate if the overflow is smaller than this
+
+
+RESEARCH_DIR_ENV = "REDDIT_RESEARCH_DIR"
+
+
+def _validate_save(ctx, param, value):
+    if value is not None and not value.strip():
+        raise click.BadParameter("TOPIC must be non-empty")
+    return value
+
+
+SAVE_FLAG = click.option(
+    "--save", "save_topic", default=None, metavar="TOPIC", callback=_validate_save,
+    help="Also write this output to research/<TOPIC>/ "
+         "(markdown; jsonl when the command's --jsonl flag is set)")
+
+
+def _slug(text: str) -> str:
+    """Filesystem-safe fragment (also blocks path traversal in topic names)."""
+    cleaned = re.sub(r"[^A-Za-z0-9._+-]", "_", (text or "").strip())[:60]
+    # No leading dots: blocks '.', '..' escapes and hidden directories
+    return cleaned.lstrip(".") or "untitled"
+
+
+def _research_file(topic: str, kind: str, ext: str, root: str = None) -> Path:
+    root_path = Path(root or os.environ.get(RESEARCH_DIR_ENV, "research"))
+    directory = root_path if root else root_path / _slug(topic)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = directory / f"{stamp}-{_slug(kind)}{ext}"
+    n = 2
+    while path.exists():
+        path = directory / f"{stamp}-{_slug(kind)}-{n}{ext}"
+        n += 1
+    return path
+
+
+def _save_rendered(topic: str, kind: str, render_fn, jsonl: bool = False, root: str = None):
+    """Capture render_fn's stdout into a timestamped research file.
+
+    A save failure (read-only dir, full disk, bad REDDIT_RESEARCH_DIR) must not
+    swallow the fetched results — warn and let the command still render.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        render_fn()
+    try:
+        path = _research_file(topic, kind, ".jsonl" if jsonl else ".md", root=root)
+        path.write_text(buf.getvalue(), encoding="utf-8")
+    except OSError as e:
+        click.echo(f"warning: could not save research file: {e}", err=True)
+        return None
+    click.echo(f"saved: {path}", err=True)
+    return path
+
+
+def _thread_view_annotations(data: dict) -> list:
+    """Non-empty when the comment list is a flat extract rather than the tree."""
+    notes = []
+    if "filtered_out" in data:
+        notes.append(f"{data['filtered_out']} filtered out")
+    if data.get("delta_view"):
+        notes.append(f"{data.get('seen_filtered', 0)} previously seen")
+    return notes
+
+
+def _emit_thread_jsonl(result: dict, fields: str) -> None:
+    # --fields applies to the post line too (shared keys project; the rest
+    # drop silently — comment-only fields shouldn't warn here)
+    post = result.get("post", {})
+    post_line = _project([post], fields, warn=False)[0] if post else {}
+    click.echo(_jsonl_line({"post": post_line}))
+    for c in _project(result.get("comments", []), fields):
+        click.echo(_jsonl_line(c))
+    meta = {k: result[k] for k in ("total", "more_count", "filtered_out", "seen_filtered")
+            if k in result}
+    click.echo(_jsonl_line({"_meta": meta}))
 
 
 def _url_host(url: str) -> str:
@@ -531,19 +612,17 @@ def _render_post_detail(data: dict) -> None:
 
     console.print(Panel("\n".join(lines), title="Post Details", expand=False))
 
-    # A filtered view is a flat extract, not a tree — indenting by original
-    # depth would assert reply structure whose parents may be filtered out
-    filtered = "filtered_out" in data
+    # Filtered/delta views are flat extracts, not trees — indenting by original
+    # depth would assert reply structure whose parents aren't shown
+    flat = _thread_view_annotations(data)
     if comments:
         op = post.get("author", "")
-        if filtered:
-            console.print(
-                f"\n[bold]{len(comments)} comments "
-                f"(filtered view — {data['filtered_out']} hidden, reply structure not shown):[/bold]\n")
+        if flat:
+            console.print(f"\n[bold]{len(comments)} comments ({'; '.join(flat)} — flat view):[/bold]\n")
         else:
             console.print(f"\n[bold]{len(comments)} comments (replies indented):[/bold]\n")
         for c in comments:
-            depth = 0 if filtered else c.get("depth", 0)
+            depth = 0 if flat else c.get("depth", 0)
             indent = "  " * depth
             author = c.get("author") or "[deleted]"
             snippet = _comment_snippet(c.get("body", ""), 120 - 2 * depth)
@@ -551,9 +630,8 @@ def _render_post_detail(data: dict) -> None:
             pin = "[dim]\\[pinned][/dim] " if c.get("stickied") else ""
             op_tag = " [cyan]\\[OP][/cyan]" if op and author == op and author != "[deleted]" else ""
             console.print(f"  {indent}{pin}[green]{escape(author)}[/green]{op_tag} ({score} pts): {escape(snippet)}")
-    elif filtered:
-        console.print(f"\n[yellow]No comments matched the filters "
-                      f"({data['filtered_out']} filtered out).[/yellow]")
+    elif flat:
+        console.print(f"\n[yellow]No comments to show ({'; '.join(flat)}).[/yellow]")
 
     more = data.get("more_count", 0)
     if more:
@@ -583,18 +661,17 @@ def _render_post_detail_markdown(data: dict) -> None:
             click.echo(f"\n### Text\n{selftext[:SELFTEXT_PREVIEW]}")
             click.echo(f"\n_… truncated ({len(selftext) - SELFTEXT_PREVIEW} more chars — use -j for full text)_")
 
-    filtered = "filtered_out" in data
-    if not comments and filtered:
-        click.echo(f"\n_No comments matched the filters ({data['filtered_out']} filtered out)._")
+    flat = _thread_view_annotations(data)
+    if not comments and flat:
+        click.echo(f"\n_No comments to show ({'; '.join(flat)})._")
     if comments:
         op = post.get("author", "")
-        if filtered:
-            click.echo(f"\n### Comments ({len(comments)} shown, "
-                       f"{data['filtered_out']} filtered out — flat view)\n")
+        if flat:
+            click.echo(f"\n### Comments ({len(comments)} shown; {'; '.join(flat)} — flat view)\n")
         else:
             click.echo(f"\n### Comments ({len(comments)} fetched, replies nested)\n")
         for c in comments:
-            indent = "" if filtered else "  " * c.get("depth", 0)
+            indent = "" if flat else "  " * c.get("depth", 0)
             author = c.get("author") or "[deleted]"
             body = (c.get("body") or "").strip()
             if body and _URL_ONLY_RE.fullmatch(body):
@@ -636,13 +713,14 @@ def main(ctx, debug, no_cache):
 @click.option("--after", default=None, help="Pagination cursor")
 @listing_options
 @NSFW_FLAG
+@SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")
 @click.option("--markdown", "-m", is_flag=True, help="Output as markdown")
 @output_options
 @common_options
 @click.pass_context
 def search(ctx, query, subreddit, sort, time_filter, limit, after, pages, since, seen_name,
-           include_nsfw, json_output, markdown, jsonl, fields, no_cache, debug):
+           include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Search Reddit posts.
 
     The query passes through Reddit's search operators untouched:
@@ -657,6 +735,11 @@ def search(ctx, query, subreddit, sort, time_filter, limit, after, pages, since,
     result = _apply_since(result, since)
     visible_for_seen = result  # suppressed-but-still-visible items refresh recency
     result = _apply_seen(result, seen_name)
+    if save_topic:
+        _save_rendered(save_topic, f"search-{query}",
+                       (lambda: _emit_structured(result, True, False, fields)) if jsonl
+                       else (lambda: _render_posts_markdown(result, f"Search: {query}")),
+                       jsonl=jsonl)
     _output_posts(result, f"Search: {query}", json_output, markdown, jsonl, fields)
     _record_seen(visible_for_seen, seen_name)
 
@@ -671,13 +754,14 @@ def search(ctx, query, subreddit, sort, time_filter, limit, after, pages, since,
 @click.option("--after", default=None)
 @listing_options
 @NSFW_FLAG
+@SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
 @output_options
 @common_options
 @click.pass_context
 def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, pages, since, seen_name,
-                 include_nsfw, json_output, markdown, jsonl, fields, no_cache, debug):
+                 include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Search Reddit comments."""
     client = _client(ctx, no_cache, debug)
     result = client.paginate(client.search_comments, pages=pages, query=query,
@@ -688,6 +772,11 @@ def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, pages, 
     result = _apply_since(result, since)
     visible_for_seen = result  # suppressed-but-still-visible items refresh recency
     result = _apply_seen(result, seen_name)
+    if save_topic:
+        _save_rendered(save_topic, f"comments-{query}",
+                       (lambda: _emit_structured(result, True, False, fields)) if jsonl
+                       else (lambda: _render_comments_markdown(result, f"Comments: {query}")),
+                       jsonl=jsonl)
     if not _emit_structured(result, jsonl, json_output, fields):
         if markdown:
             _render_comments_markdown(result, f"Comments: {query}")
@@ -704,13 +793,14 @@ def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, pages, 
 @click.option("--after", default=None)
 @listing_options
 @NSFW_FLAG
+@SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
 @output_options
 @common_options
 @click.pass_context
 def posts(ctx, subreddit, sort, time_filter, limit, after, pages, since, seen_name,
-          include_nsfw, json_output, markdown, jsonl, fields, no_cache, debug):
+          include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Get posts from a subreddit (hot, new, top, rising, controversial).
 
     SUBREDDIT may be comma-separated (a+b multireddit fan-in, server-side).
@@ -724,6 +814,11 @@ def posts(ctx, subreddit, sort, time_filter, limit, after, pages, since, seen_na
     result = _apply_since(result, since)
     visible_for_seen = result  # suppressed-but-still-visible items refresh recency
     result = _apply_seen(result, seen_name)
+    if save_topic:
+        _save_rendered(save_topic, f"posts-{subreddit}-{sort}",
+                       (lambda: _emit_structured(result, True, False, fields)) if jsonl
+                       else (lambda: _render_posts_markdown(result, f"r/{subreddit} ({sort})")),
+                       jsonl=jsonl)
     _output_posts(result, f"r/{subreddit} ({sort})", json_output, markdown, jsonl, fields)
     _record_seen(visible_for_seen, seen_name)
 
@@ -764,13 +859,17 @@ def info(ctx, subreddit, json_output, markdown, jsonl, fields, no_cache, debug):
               help="Only show comments by this author (e.g. the OP)")
 @click.option("--min-score", default=None, type=int,
               help="Only show comments with at least this score")
+@click.option("--seen", "seen_name", default=None, metavar="NAME",
+              help="Delta view: only comments not emitted by previous runs under NAME "
+                   "(follow a developing thread cheaply)")
+@SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
 @output_options
 @common_options
 @click.pass_context
 def thread(ctx, target, post_id, sort, limit, depth, no_expand, author_filter, min_score,
-           json_output, markdown, jsonl, fields, no_cache, debug):
+           seen_name, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Get a post with its comment thread.
 
     TARGET is a subreddit (with POST_ID as second argument), or a full post
@@ -808,16 +907,23 @@ def thread(ctx, target, post_id, sort, limit, depth, no_expand, author_filter, m
         result = {**result, "comments": kept, "total": len(kept),
                   "filtered_out": len(comments) - len(kept)}
 
+    # Delta view: only comments that appeared since the last run under this name
+    visible_comments = result.get("comments", [])
+    if seen_name:
+        new = SeenStore().filter_new(seen_name, visible_comments)
+        if len(new) != len(visible_comments):
+            result = {**result, "comments": new, "total": len(new),
+                      "seen_filtered": len(visible_comments) - len(new),
+                      "delta_view": True}
+
+    if save_topic:
+        _save_rendered(save_topic, f"thread-{result.get('post', {}).get('id', pid)}",
+                       (lambda: _emit_thread_jsonl(result, fields)) if jsonl
+                       else (lambda: _render_post_detail_markdown(result)),
+                       jsonl=jsonl)
+
     if jsonl:
-        # --fields applies to the post line too (shared keys project; the rest
-        # drop silently — comment-only fields shouldn't warn here)
-        post = result.get("post", {})
-        post_line = _project([post], fields, warn=False)[0] if post else {}
-        click.echo(_jsonl_line({"post": post_line}))
-        for c in _project(result.get("comments", []), fields):
-            click.echo(_jsonl_line(c))
-        meta = {k: result[k] for k in ("total", "more_count", "filtered_out") if k in result}
-        click.echo(_jsonl_line({"_meta": meta}))
+        _emit_thread_jsonl(result, fields)
     elif json_output:
         if fields:
             result = {**result, "comments": _project(result.get("comments", []), fields)}
@@ -826,6 +932,13 @@ def thread(ctx, target, post_id, sort, limit, depth, no_expand, author_filter, m
         _render_post_detail_markdown(result)
     else:
         _render_post_detail(result)
+
+    # Record after successful output; still-visible suppressed comments refresh recency
+    if seen_name:
+        try:
+            SeenStore().record(seen_name, visible_comments)
+        except OSError as e:
+            click.echo(f"warning: could not update seen store: {e}", err=True)
 
 
 @main.command()
@@ -999,11 +1112,12 @@ def popular_subs(ctx, limit, after, pages, include_nsfw, json_output, markdown, 
               help="Comments to fetch per excerpted thread")
 @click.option("--query", "-q", default=None, help="Also run a post search within the subreddit")
 @NSFW_FLAG
+@SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @common_options
 @click.pass_context
 def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, query,
-           include_nsfw, json_output, no_cache, debug):
+           include_nsfw, save_topic, json_output, no_cache, debug):
     """One-shot recon: info + top posts + top-thread excerpts (+ optional search).
 
     Replaces the usual 10-15 command opening sweep of a research session with
@@ -1038,6 +1152,27 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
         if "error" in search_res:
             search_res = {"items": [], "error": search_res["error"]}
 
+    def render_markdown():
+        # Markdown document (default — a digest is a report, not a table)
+        click.echo(f"# r/{info_res.get('name', subreddit)} digest — top/{time_filter}")
+        click.echo(f"\n{info_res.get('subscribers', 0):,} subscribers — {info_res.get('description', '')}\n")
+        _render_posts_markdown(posts_res, f"Top posts ({time_filter})")
+        for t in threads:
+            click.echo("\n---\n")
+            _render_post_detail_markdown(t)
+        for s in skipped:
+            click.echo(f"\n_Thread excerpt for \"{_escape_md(_truncate(s['title'], 60))}\" "
+                       f"skipped: {s['error']}_")
+        if search_res is not None:
+            click.echo("\n---\n")
+            if search_res.get("error"):
+                click.echo(f"_Search failed: {search_res['error']}_")
+            else:
+                _render_posts_markdown(search_res, f"Search: {query}")
+
+    if save_topic:
+        _save_rendered(save_topic, f"digest-{subreddit}", render_markdown)
+
     if json_output:
         out = {"info": info_res, "top_posts": posts_res, "threads": threads}
         if skipped:
@@ -1047,22 +1182,186 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
         click.echo(json.dumps(out, indent=2))
         return
 
-    # Markdown document (default — a digest is a report, not a table)
-    click.echo(f"# r/{info_res.get('name', subreddit)} digest — top/{time_filter}")
-    click.echo(f"\n{info_res.get('subscribers', 0):,} subscribers — {info_res.get('description', '')}\n")
-    _render_posts_markdown(posts_res, f"Top posts ({time_filter})")
-    for t in threads:
-        click.echo("\n---\n")
-        _render_post_detail_markdown(t)
-    for s in skipped:
-        click.echo(f"\n_Thread excerpt for \"{_escape_md(_truncate(s['title'], 60))}\" "
-                   f"skipped: {s['error']}_")
-    if search_res is not None:
-        click.echo("\n---\n")
-        if search_res.get("error"):
-            click.echo(f"_Search failed: {search_res['error']}_")
+    render_markdown()
+
+
+@main.group()
+def topic():
+    """Standing research topics: create once, `update` for deltas.
+
+    A topic binds subreddits (+ optional query) to a research folder and a
+    delta store. Each `update` fetches only what's new since the last run and
+    appends a markdown update file to the folder. Keep your own synthesis in
+    NOTES.md alongside — the CLI owns evidence, you own understanding.
+    """
+
+
+@topic.command(name="create")
+@click.argument("name")
+@click.option("--subreddits", "-r", required=True,
+              help="Comma-separated subreddits to track")
+@click.option("--query", "-q", default=None, help="Optional standing search query")
+@click.option("--time", "-t", "time_filter", type=click.Choice(TIME_CHOICES),
+              default="week", show_default=True, help="Time window for the query search")
+@click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True,
+              help="Max items per sweep")
+@click.option("--dir", "directory", default=None,
+              help="Research folder (default: ./research/<name>)")
+@NSFW_FLAG
+def topic_create(name, subreddits, query, time_filter, limit, directory, include_nsfw):
+    """Create a standing topic."""
+    name = _slug(name)
+    store = TopicStore()
+    if store.get(name):
+        console.print(f"[yellow]Topic '{name}' already exists — remove it first to reconfigure.[/yellow]")
+        raise SystemExit(1)
+    resolved_dir = str(Path(directory).resolve() if directory
+                       else (Path(os.environ.get(RESEARCH_DIR_ENV, "research")) / name).resolve())
+    store.set(name, {
+        "subreddits": subreddits,
+        "query": query,
+        "time": time_filter,
+        "limit": limit,
+        "nsfw": include_nsfw,
+        "dir": resolved_dir,
+        "created": time.time(),
+        "updates": 0,
+    })
+    console.print(f"[green]Created topic '{name}'[/green] tracking r/{subreddits}"
+                  + (f" + query {query!r}" if query else ""))
+    console.print(f"[dim]Folder: {resolved_dir} — run: reddit topic update {name}[/dim]")
+
+
+@topic.command(name="list")
+def topic_list():
+    """List standing topics."""
+    topics = TopicStore().all()
+    if not topics:
+        console.print("[dim]No topics yet — reddit topic create <name> -r <subs>[/dim]")
+        return
+    for name, cfg in sorted(topics.items()):
+        last = _format_age(cfg.get("last_update", 0)) or "never"
+        query = f" q={cfg['query']!r}" if cfg.get("query") else ""
+        console.print(f"[cyan]{name}[/cyan]: r/{cfg.get('subreddits', '?')}{query} "
+                      f"— {cfg.get('updates', 0)} update(s), last {last}")
+        console.print(f"  [dim]{cfg.get('dir', '')}[/dim]")
+
+
+@topic.command(name="remove")
+@click.argument("name")
+def topic_remove(name):
+    """Remove a topic (config + delta store; the research folder is kept)."""
+    name = _slug(name)  # same normalization as create, so names round-trip
+    if not TopicStore().remove(name):
+        console.print(f"[yellow]No topic named '{name}'[/yellow]")
+        raise SystemExit(1)
+    SeenStore().clear(f"topic:{name}")
+    console.print(f"[green]Removed topic '{name}' (research folder kept)[/green]")
+
+
+@topic.command(name="update")
+@click.argument("name")
+@click.option("--jsonl", is_flag=True, help="Emit delta items as jsonl on stdout")
+@common_options
+@click.pass_context
+def topic_update(ctx, name, jsonl, no_cache, debug):
+    """Fetch what's new for a topic and append it to its research folder."""
+    name = _slug(name)  # same normalization as create, so names round-trip
+    store = TopicStore()
+    cfg = store.get(name)
+    if not cfg:
+        _error_exit({"error": f"No topic named '{name}' — reddit topic list"}, jsonl)
+    client = _client(ctx, no_cache, debug)
+    seen_key = f"topic:{name}"
+    include_nsfw = cfg.get("nsfw", False)
+
+    posts_res = client.subreddit_posts(cfg["subreddits"], sort="new",
+                                       limit=cfg.get("limit", 25), include_nsfw=include_nsfw)
+    if _error_exit(posts_res, jsonl):
+        return
+    posts_visible = posts_res
+    posts_res = _apply_seen(posts_res, seen_key)
+
+    search_res = search_visible = None
+    query_error = None
+    if cfg.get("query"):
+        search_res = client.search(cfg["query"], subreddit=cfg["subreddits"], sort="new",
+                                   time_filter=cfg.get("time", "week"),
+                                   limit=cfg.get("limit", 25), include_nsfw=include_nsfw)
+        if "error" in search_res:
+            query_error = search_res["error"]
+            click.echo(f"warning: query sweep failed: {query_error}", err=True)
+            search_res = None
         else:
-            _render_posts_markdown(search_res, f"Search: {query}")
+            search_visible = search_res
+            search_res = _apply_seen(search_res, seen_key)
+            # Drop hits already reported by the posts sweep this run
+            new_post_names = {i.get("name") for i in posts_res.get("items", [])}
+            hits = [i for i in search_res.get("items", []) if i.get("name") not in new_post_names]
+            search_res = {**search_res, "items": hits, "count": len(hits)}
+
+    new_posts = posts_res.get("items", [])
+    new_hits = search_res.get("items", []) if search_res else []
+    total_new = len(new_posts) + len(new_hits)
+    nsfw_hidden = (posts_res.get("nsfw_hidden", 0) or 0) + \
+                  ((search_res.get("nsfw_hidden", 0) or 0) if search_res else 0)
+
+    def render_markdown():
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        click.echo(f"# topic: {name} — update {stamp}")
+        click.echo("")
+        _render_posts_markdown(
+            {"items": new_posts, "count": len(new_posts),
+             "nsfw_hidden": posts_res.get("nsfw_hidden", 0)},
+            f"New posts in r/{cfg['subreddits']}")
+        if search_res is not None:
+            click.echo("")
+            _render_posts_markdown(
+                {"items": new_hits, "count": len(new_hits),
+                 "nsfw_hidden": search_res.get("nsfw_hidden", 0)},
+                f"New matches: {cfg['query']}")
+        if query_error:
+            click.echo(f"\n_Query sweep failed this run: {query_error}_")
+
+    if total_new:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            render_markdown()
+        try:
+            update_path = _research_file(name, "update", ".md", root=cfg["dir"])
+            update_path.write_text(buf.getvalue(), encoding="utf-8")
+            click.echo(f"saved: {update_path}", err=True)
+        except OSError as e:
+            click.echo(f"warning: could not save update file: {e}", err=True)
+
+    if jsonl:
+        for item in new_posts:
+            click.echo(_jsonl_line({**item, "topic_source": "posts"}))
+        for item in new_hits:
+            click.echo(_jsonl_line({**item, "topic_source": "search"}))
+        meta = {"topic": name, "new": total_new}
+        if nsfw_hidden:
+            meta["nsfw_hidden"] = nsfw_hidden
+        if query_error:
+            meta["query_error"] = query_error
+        click.echo(_jsonl_line({"_meta": meta}))
+    elif total_new:
+        render_markdown()
+    else:
+        console.print(f"[dim]No new activity for topic '{name}'.[/dim]")
+        if nsfw_hidden:
+            console.print(f"[dim]{nsfw_hidden} NSFW result(s) hidden — recreate the topic "
+                          f"with --nsfw to include them[/dim]")
+        if query_error:
+            console.print(f"[dim]query sweep failed: {escape(query_error)}[/dim]")
+
+    for visible in (posts_visible, search_visible):
+        if visible is not None:
+            try:
+                SeenStore().record(seen_key, visible.get("items", []))
+            except OSError as e:
+                click.echo(f"warning: could not update seen store: {e}", err=True)
+    store.set(name, {**cfg, "last_update": time.time(), "updates": cfg.get("updates", 0) + 1})
 
 
 @main.command()

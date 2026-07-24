@@ -256,3 +256,47 @@ Nine confirmed findings, all fixed:
   header; all-filtered threads say so instead of rendering empty).
 
 Suite after this round: 127 passed.
+
+---
+
+## Round 5 — research persistence (2026-07-24)
+
+Three features turning one-off sessions into standing research (README
+"Research workflow" section): `thread --seen NAME` (delta reads of developing
+threads, flat view with "N previously seen"), `--save TOPIC` on
+search/comments/posts/thread/digest (append evidence to `research/<topic>/`),
+and `reddit topic create/list/update/remove` (standing sweeps: subs + optional
+query bound to a folder + delta store; `update` appends only what's new).
+
+Live dogfooding validated crash consistency by accident: a SIGPIPE (`| head`)
+killed an update mid-render, and the at-least-once design did exactly the
+right thing — nothing recorded, items re-emitted next run, no false
+suppression.
+
+### Verification round (adversarial, 26 agents) — 10 confirmed, all fixed
+
+- [x] **T1. Path traversal via dot-only topic names (medium)** — `--save ..`
+  escaped the research root (`_slug` allowed dots). Leading dots now stripped;
+  `.`/`..` become "untitled", `..hidden` can't create hidden dirs.
+- [x] **T2. NSFW silently dropped from topic updates (medium)** — no opt-in, no
+  note: a monitoring tool reporting "No new activity" while tagged posts
+  existed. `topic create --nsfw` opt-in added; `nsfw_hidden` now surfaces in
+  update files, `_meta`, and the no-activity message.
+- [x] **T3. Save failure crashed before render** — read-only dir/full disk cost
+  the whole fetched result. Saves now warn on stderr and rendering proceeds.
+- [x] **T4. `write_text` without utf-8 encoding** — emoji/CJK titles would
+  crash saves on non-UTF-8 locales. All research/store writes pinned to utf-8.
+- [x] **T5. `--save ''` was a silent no-op** — now rejected at parse time.
+- [x] **T6. Query-sweep failures invisible to machines** — a forever-403 query
+  looked like clean success in `_meta` and the archive. Now `query_error` in
+  `_meta` plus a note in the update file.
+- [x] **T7. `create` slugged names but `update`/`remove` didn't** — "a b"
+  created 'a_b' then couldn't be updated by the name the user typed. All
+  lookups normalize identically now.
+- [x] **T8. Stray verifier test dir in repo root** — removed; `research/` is
+  now gitignored (user data, not source).
+- [x] **T9. `--save` help advertised `--jsonl` on digest (which lacks it)** —
+  reworded.
+- [x] **T10. (dup of T1 from second lens)** — same fix.
+
+Suite after this round: 148 passed.

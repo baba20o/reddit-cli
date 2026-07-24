@@ -91,11 +91,14 @@ reddit search "LLM" -m
 | `reddit popular` | Trending posts from r/popular |
 | `reddit popular-subs` | Popular subreddits |
 
-### Recon
+### Recon & Research
 
 | Command | Description |
 |---------|-------------|
 | `reddit digest <subreddit>` | One-shot recon: info + top posts + thread excerpts (+ `-q` search) |
+| `reddit topic create <name> -r <subs> [-q query]` | Create a standing research topic |
+| `reddit topic update <name>` | Fetch only what's new for a topic, append to its research folder |
+| `reddit topic list` / `remove <name>` | Manage standing topics |
 
 ### Utility
 
@@ -156,6 +159,30 @@ reddit thread <url> -n 200 --author some_op --jsonl
 Reddit's native search operators pass through unchanged: `author:name`,
 `self:yes`, `flair:"Discussion"`, `title:foo`, and boolean `OR` all work inside
 the query string.
+
+### Research workflow
+
+The pieces compose into a standing research loop:
+
+```bash
+# 1. Recon a topic once
+reddit digest DataHoarder -t week -T 3 --save digi-pres
+
+# 2. Deep-read the threads that matter; follow developing ones cheaply
+reddit thread <url> -n 200 --save digi-pres          # archive the full read
+reddit thread <url> --seen digi-jellyfin             # later: only NEW comments
+
+# 3. Make it standing: one command per check-in, deltas only
+reddit topic create digi-pres -r DataHoarder,Archiveteam -q "digital preservation"
+reddit topic update digi-pres        # appends new activity to research/digi-pres/
+```
+
+`--save TOPIC` on `search`/`comments`/`posts`/`thread`/`digest` appends the
+output (markdown, or jsonl with `--jsonl`) to `research/<TOPIC>/` (override the
+root with `REDDIT_RESEARCH_DIR`). `thread --seen NAME` shows only comments that
+appeared since your last read — new replies render flat with a
+"N previously seen" note. The convention: the CLI owns the evidence files;
+keep your synthesis in `research/<topic>/NOTES.md`.
 
 ### Thread options
 
