@@ -99,6 +99,7 @@ reddit search "LLM" -m
 | `reddit topic create <name> -r <subs> [-q query]` | Create a standing research topic |
 | `reddit topic update <name>` | Fetch only what's new for a topic, append to its research folder |
 | `reddit topic list` / `remove <name>` | Manage standing topics |
+| `reddit media <subreddit\|post-url>` | Download image/video attachments (galleries included) with a manifest |
 
 ### Utility
 
@@ -183,6 +184,27 @@ root with `REDDIT_RESEARCH_DIR`). `thread --seen NAME` shows only comments that
 appeared since your last read — new replies render flat with a
 "N previously seen" note. The convention: the CLI owns the evidence files;
 keep your synthesis in `research/<topic>/NOTES.md`.
+
+### Media attachments
+
+```bash
+# All attachments from a subreddit's top-of-month (galleries expanded)
+reddit media eink --sort top -t month -n 25 --save my-topic
+
+# One post's attachments; delta-monitor a sub's new media on cron
+reddit media https://reddit.com/r/eink/comments/abc123/foo/
+reddit media DataHoarder --sort new --seen dh-media --jsonl
+```
+
+Files land as `<postid>-<n>.<ext>` beside a `manifest.jsonl` mapping every
+file to its post (id, title, permalink, author, status). Safety rails:
+Reddit/imgur CDNs only by default (`--any-host` relaxes to media-extension
+URLs on any https host), content-type verified (an HTML error page never gets
+saved as `.jpg`), per-file size cap (`--max-size`, 50MB default) enforced
+mid-stream, `--max-files` run cap, NSFW excluded unless `--nsfw`, and re-runs
+skip existing files. Reddit-hosted video is the DASH fallback stream (no audio
+track). Media fetches use a separate unauthenticated session — your OAuth
+token never touches a CDN.
 
 ### Thread options
 

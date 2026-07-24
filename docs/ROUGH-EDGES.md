@@ -300,3 +300,49 @@ suppression.
 - [x] **T10. (dup of T1 from second lens)** — same fix.
 
 Suite after this round: 148 passed.
+
+---
+
+## Round 6 — media attachments (2026-07-24)
+
+`reddit media <sub|post-url>` downloads image/video attachments (galleries
+expanded) to disk with a `manifest.jsonl` mapping each file to its post. The
+payoff beyond archiving: downloaded images are readable — an agent can analyze
+the actual benchmark chart / rig photo / screenshot instead of seeing a bare
+`i.redd.it` URL. New module `reddit/media.py` (extraction lives in
+`api._extract_media`, streaming download + manifest in `MediaDownloader`).
+Live-validated by downloading r/eink's top-of-month and reading a DASUNG
+e-ink-monitor rig photo.
+
+Safety by design: post-id-only filenames (traversal-proof), content-type
+verified, size cap enforced mid-stream, host allowlist, separate
+unauthenticated session (OAuth token never touches a CDN).
+
+### Verification round (adversarial, 30 agents, highest-scrutiny surface) — 12 confirmed, all fixed
+
+- [x] **M1. SSRF via redirects (security, medium→high)** — `requests` follows
+  redirects by default, so an allowlisted URL could 302 to
+  `http://169.254.169.254/…` (cloud metadata) or downgrade to http, bypassing
+  the host allowlist entirely. A verifier proved it end-to-end against a local
+  server. Fixed: `allow_redirects=False` + manual following that re-validates
+  the host and https scheme at **every** hop.
+- [x] **M2. `--max-files` + `--seen` lost media forever (HIGH, ×2 lenses)** —
+  posts past the cap were recorded as seen without being fetched, so a later
+  uncapped run skipped them permanently. Fixed: only posts actually processed
+  (and failure-free) are recorded; a per-post download budget bounds gallery
+  overshoot and marks the run truncated.
+- [x] **M3. Crosspost media never extracted (medium)** — the child post carries
+  null media; the real media is on `crosspost_parent_list[0]`. Now consulted.
+- [x] **M4. imgur `.gifv` always failed (medium)** — `.gifv` is an HTML player;
+  the file is the `.mp4` at the same id. Now rewritten on extraction.
+- [x] **M5. Single-post path ignored the NSFW rail (medium)** — a pasted NSFW
+  post URL downloaded without `--nsfw`. Now blocked with a clear error.
+- [x] **M6. jsonl `_meta` hid truncation + dropped partial_error (medium)** — a
+  cron consumer couldn't tell a capped run from a complete one. `truncated` and
+  `partial_error` now in `_meta`.
+- [x] **M7–M12 (low)** — SVG (scriptable image) content-type now blocked;
+  `--seen` on a single post warns instead of silently no-op'ing; an
+  all-downloads-failed run exits nonzero; default `./media` gitignored;
+  gallery overshoot of `--max-files` bounded (dup of M2's budget fix).
+
+Suite after this round: 180 passed.

@@ -1185,6 +1185,161 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
     render_markdown()
 
 
+@main.command()
+@click.argument("target")
+@click.option("--sort", "-s", type=click.Choice(SORT_CHOICES), default="hot", show_default=True)
+@click.option("--time", "-t", "time_filter", type=click.Choice(TIME_CHOICES), default="all", show_default=True)
+@click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True,
+              help="Posts to scan per page")
+@click.option("--pages", default=1, type=click.IntRange(1, 10), show_default=True)
+@click.option("--seen", "seen_name", default=None, metavar="NAME",
+              help="Only download media from posts not handled by previous runs under NAME")
+@click.option("--max-files", default=100, type=click.IntRange(1, 1000), show_default=True,
+              help="Stop after this many downloads")
+@click.option("--max-size", default=50, type=click.IntRange(1, 500), show_default=True,
+              help="Per-file size cap in MB")
+@click.option("--any-host", is_flag=True,
+              help="Allow media-extension URLs from any https host "
+                   "(default: Reddit/imgur CDNs only)")
+@click.option("--dir", "directory", default=None,
+              help="Destination directory (default ./media, or research/<TOPIC>/media with --save)")
+@NSFW_FLAG
+@SAVE_FLAG
+@click.option("--jsonl", is_flag=True, help="Emit manifest entries as jsonl on stdout")
+@common_options
+@click.pass_context
+def media(ctx, target, sort, time_filter, limit, pages, seen_name, max_files, max_size,
+          any_host, directory, include_nsfw, save_topic, jsonl, no_cache, debug):
+    """Download image/video attachments from a post or a subreddit listing.
+
+    TARGET is a subreddit name (scan its listing) or a post URL / t3_ fullname
+    (that post's attachments, galleries included). Files land as
+    <postid>-<n>.<ext> next to a manifest.jsonl mapping each file to its post.
+    Re-runs skip files that already exist. Reddit-hosted video downloads are
+    the DASH fallback stream (no audio track).
+
+    \b
+    Examples:
+      reddit media eink --sort top -t month -n 25
+      reddit media https://reddit.com/r/eink/comments/abc123/foo/
+      reddit media DataHoarder --seen dh-media --save digi-pres
+    """
+    from reddit.media import MediaDownloader
+
+    client = _client(ctx, no_cache, debug)
+
+    # URLs/fullnames are posts; a bare word is a subreddit (the listing is
+    # the primary use case here, unlike `thread`)
+    is_post_ref = "/" in target or target.startswith("t3_")
+    if is_post_ref:
+        if seen_name:
+            click.echo("note: --seen has no effect on a single post", err=True)
+        try:
+            sub, pid = parse_post_reference(target)
+        except ValueError as e:
+            _error_exit({"error": str(e)}, jsonl)
+        result = client.post_comments(sub, pid, limit=1, expand_more=False)
+        if _error_exit(result, jsonl):
+            return
+        post = result.get("post", {})
+        # The listing path filters NSFW; honor the same rail on the post path
+        if post.get("over_18") and not include_nsfw:
+            _error_exit({"error": "post is NSFW — pass --nsfw to download its media"}, jsonl)
+        posts = [post]
+        visible_for_seen = {"items": posts}
+    else:
+        result = client.paginate(client.subreddit_posts, pages=pages, subreddit=target,
+                                 sort=sort, time_filter=time_filter, limit=limit,
+                                 include_nsfw=include_nsfw)
+        if _error_exit(result, jsonl):
+            return
+        visible_for_seen = result
+        result = _apply_seen(result, seen_name)
+        posts = result.get("items", [])
+
+    if directory:
+        dest = Path(directory)
+    elif save_topic:
+        dest = Path(os.environ.get(RESEARCH_DIR_ENV, "research")) / _slug(save_topic) / "media"
+    else:
+        dest = Path("media")
+
+    downloader = MediaDownloader(dest, max_bytes=max_size * 1024 * 1024, any_host=any_host)
+    entries = []
+    downloaded = 0
+    processed = []          # posts fully handled (safe to mark seen)
+    failed_posts = set()
+    truncated = False
+    for post in posts:
+        if not post.get("media"):
+            processed.append(post)  # nothing to fetch — genuinely handled
+            continue
+        if downloaded >= max_files:
+            click.echo(f"warning: stopped at --max-files {max_files}; "
+                       f"{len(posts) - len(processed)} post(s) not fetched", err=True)
+            truncated = True
+            break
+        post_entries, dl, complete = downloader.download_post(post, budget=max_files - downloaded)
+        entries.extend(post_entries)
+        downloaded += dl
+        if any(e["status"] == "failed" for e in post_entries):
+            failed_posts.add(post.get("name"))
+        if not complete:
+            # budget cut this post short — do NOT record it, so the rest
+            # download next run
+            truncated = True
+            click.echo(f"warning: stopped at --max-files {max_files}; "
+                       f"{len(posts) - len(processed)} post(s) not fully fetched", err=True)
+            break
+        processed.append(post)
+
+    counts = {}
+    for e in entries:
+        counts[e["status"]] = counts.get(e["status"], 0) + 1
+
+    if jsonl:
+        for e in entries:
+            click.echo(_jsonl_line(e))
+        meta = {"dir": str(dest), "posts_scanned": len(processed), **counts}
+        if truncated:
+            meta["truncated"] = True
+        if result.get("seen_filtered"):
+            meta["seen_filtered"] = result["seen_filtered"]
+        if result.get("nsfw_hidden"):
+            meta["nsfw_hidden"] = result["nsfw_hidden"]
+        if result.get("partial_error"):
+            meta["partial_error"] = result["partial_error"]
+        click.echo(_jsonl_line({"_meta": meta}))
+    else:
+        for e in entries:
+            tag = {"downloaded": "[green]✓[/green]", "exists": "[dim]=[/dim]",
+                   "skipped": "[yellow]s[/yellow]", "failed": "[red]x[/red]"}[e["status"]]
+            detail = e.get("file") or e.get("reason") or e.get("error", "")
+            console.print(f"{tag} {escape(e['post_id'])} {escape(detail)} "
+                          f"[dim]{escape(_truncate(e.get('title', ''), 50))}[/dim]")
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no media found"
+        console.print(f"\n[bold]{summary}[/bold] → {dest}/ (manifest.jsonl updated)")
+        for note in _filter_notes(result):
+            console.print(f"[dim]{escape(note)}[/dim]")
+        if _nsfw_hidden_note(result):
+            console.print(f"[dim]{_nsfw_hidden_note(result)}[/dim]")
+
+    # Record seen only for posts we fully processed with no failures, so
+    # failures/truncated posts retry next run; re-record suppressed posts for recency
+    if seen_name and not is_post_ref:
+        ok_items = [p for p in processed if p.get("name") not in failed_posts]
+        suppressed = [i for i in visible_for_seen.get("items", [])
+                      if i.get("name") not in {p.get("name") for p in posts}]
+        try:
+            SeenStore().record(seen_name, ok_items + suppressed)
+        except OSError as e:
+            click.echo(f"warning: could not update seen store: {e}", err=True)
+
+    # A run that attempted downloads and had every one fail is an error
+    if counts.get("failed") and not counts.get("downloaded") and not counts.get("exists"):
+        raise SystemExit(1)
+
+
 @main.group()
 def topic():
     """Standing research topics: create once, `update` for deltas.

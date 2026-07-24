@@ -13,11 +13,13 @@ import random
 import re
 import time
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 
 from reddit.cache import RedditCache
+from reddit.media import media_url_ext
 from reddit.rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,44 @@ def _retry_wait_seconds(attempt: int, response: requests.Response = None) -> flo
     return min(wait, MAX_RETRY_WAIT)
 
 
+def _extract_media(data: dict) -> list:
+    """Normalize a post's attachments to [{"url", "type"}, ...].
+
+    Covers galleries (media_metadata, in gallery order), reddit-hosted video
+    (DASH fallback stream — video only, audio is served separately), and
+    direct image/video link posts. External non-file links yield [].
+    """
+    if data.get("is_gallery"):
+        items = []
+        meta = data.get("media_metadata") or {}
+        for entry in (data.get("gallery_data") or {}).get("items", []):
+            source = (meta.get(entry.get("media_id")) or {}).get("s") or {}
+            if source.get("u"):
+                items.append({"url": source["u"], "type": "image"})
+            elif source.get("mp4") or source.get("gif"):
+                items.append({"url": source.get("mp4") or source.get("gif"), "type": "animated"})
+        return items
+
+    video = ((data.get("secure_media") or data.get("media") or {}).get("reddit_video") or {})
+    if video.get("fallback_url"):
+        return [{"url": video["fallback_url"], "type": "video"}]
+
+    url = data.get("url") or ""
+    host = urlparse(url).hostname or ""
+    # imgur .gifv is an HTML player; the .mp4 at the same id is the real file
+    if host == "i.imgur.com" and url.lower().endswith(".gifv"):
+        return [{"url": url[:-5] + ".mp4", "type": "video"}]
+    if media_url_ext(url) or host in ("i.redd.it", "i.imgur.com"):
+        kind = "video" if media_url_ext(url) == ".mp4" else "image"
+        return [{"url": url, "type": kind}]
+
+    # Crossposts carry null media on the child; the real media is on the parent
+    parents = data.get("crosspost_parent_list")
+    if parents:
+        return _extract_media(parents[0])
+    return []
+
+
 def _format_post(post: dict) -> dict:
     """Normalize a Reddit post/link into a clean dict.
 
@@ -85,6 +125,7 @@ def _format_post(post: dict) -> dict:
         "link_flair_text": data.get("link_flair_text") or "",
         "over_18": data.get("over_18", False),
         "stickied": data.get("stickied", False),
+        "media": _extract_media(data),
     }
 
 
