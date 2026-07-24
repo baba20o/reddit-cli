@@ -91,10 +91,17 @@ reddit search "LLM" -m
 | `reddit popular` | Trending posts from r/popular |
 | `reddit popular-subs` | Popular subreddits |
 
+### Recon
+
+| Command | Description |
+|---------|-------------|
+| `reddit digest <subreddit>` | One-shot recon: info + top posts + thread excerpts (+ `-q` search) |
+
 ### Utility
 
 | Command | Description |
 |---------|-------------|
+| `reddit seen` | List/clear `--seen` delta-tracking stores (`--clear NAME`) |
 | `reddit clear-cache` | Clear local response cache |
 
 ## Common Options
@@ -115,6 +122,40 @@ reddit search "LLM" -m
 Stickied (bot/mod) comments are demoted to the end of thread output and marked
 `[pinned]`; comment search skips them and ranks comments mentioning your query
 terms first.
+
+### Agent / scripting options
+
+Built for LLM-agent and cron use — dense output, fewer invocations, delta
+tracking:
+
+| Flag | Description |
+|------|-------------|
+| `--pages N` | Auto-follow pagination cursors, merge + dedup up to N pages (max 10) |
+| `--jsonl` | One compact JSON object per line, then a `{"_meta": ...}` line with the cursor/counts; errors become `{"error", "retryable"}` lines with exit 1 |
+| `--fields a,b,c` | Project `-j`/`--jsonl` items to just these fields (unknown fields warn on stderr) |
+| `--since AGE\|DATE` | Only items newer than `90m`/`24h`/`7d`/`2w` or an ISO date |
+| `--seen NAME` | Only emit items not already emitted under NAME (state in `~/.reddit/seen.json`) — turns any listing into a monitoring delta feed |
+| `-r a,b,c` | Multireddit fan-in: searches/lists `r/a+b+c` server-side in one request |
+| `thread --author X` | Only X's comments in a thread (e.g. mine an OP's answers) |
+| `thread --min-score N` | Drop low-signal comments before they cost tokens |
+
+```bash
+# 100 dense records, 4 pages merged, only the fields you need
+reddit search "rust async" --pages 4 -n 100 --jsonl --fields title,score,permalink
+
+# Cron-friendly delta feed: only new posts since the last run
+reddit posts LocalLLaMA,ollama --sort new --since 1d --seen ai-watch --jsonl
+
+# One-command recon document for a research session
+reddit digest MachineLearning -t week -T 3 -q "interpretability" > recon.md
+
+# Mine the OP's answers out of an AMA-style thread
+reddit thread <url> -n 200 --author some_op --jsonl
+```
+
+Reddit's native search operators pass through unchanged: `author:name`,
+`self:yes`, `flair:"Discussion"`, `title:foo`, and boolean `OR` all work inside
+the query string.
 
 ### Thread options
 

@@ -127,6 +127,13 @@ def _format_subreddit(sub: dict) -> dict:
     }
 
 
+def _normalize_subreddit(subreddit):
+    """Allow comma/space-separated multireddits: 'a, b' -> 'a+b' (server-side fan-in)."""
+    if not subreddit:
+        return subreddit
+    return "+".join(p for p in re.split(r"[,+\s]+", subreddit.strip()) if p)
+
+
 def _filter_nsfw(parsed: dict, include_nsfw: bool) -> dict:
     """Drop over_18 items unless requested; record how many were hidden."""
     if include_nsfw or "error" in parsed:
@@ -344,6 +351,7 @@ class RedditClient:
             search_type: link (posts), sr (subreddits), user (users).
             include_nsfw: Include over-18 results (default: excluded).
         """
+        subreddit = _normalize_subreddit(subreddit)
         if subreddit:
             path = f"/r/{subreddit}/search"
         else:
@@ -466,7 +474,7 @@ class RedditClient:
             limit: Max results (1-100).
             include_nsfw: Include over-18 results (default: excluded).
         """
-        path = f"/r/{subreddit}/{sort}"
+        path = f"/r/{_normalize_subreddit(subreddit)}/{sort}"
         params = {"limit": min(limit, 100), "t": time_filter}
         if after:
             params["after"] = after
@@ -686,10 +694,56 @@ class RedditClient:
         result = self._get("/search", params)
         return _filter_nsfw(self._parse_listing(result, item_type="sr"), include_nsfw)
 
-    def popular_subreddits(self, limit: int = 25, include_nsfw: bool = False) -> dict:
+    def popular_subreddits(
+        self,
+        limit: int = 25,
+        after: Optional[str] = None,
+        include_nsfw: bool = False,
+    ) -> dict:
         """Get popular subreddits."""
-        result = self._get("/subreddits/popular", {"limit": min(limit, 100)})
+        params = {"limit": min(limit, 100)}
+        if after:
+            params["after"] = after
+        result = self._get("/subreddits/popular", params)
         return _filter_nsfw(self._parse_listing(result, item_type="sr"), include_nsfw)
+
+    # ── Pagination ────────────────────────────────────────
+
+    def paginate(self, method, pages: int = 1, **kwargs) -> dict:
+        """Fetch up to `pages` pages via a listing method, merging and deduping.
+
+        `method` is any client method that accepts an `after` kwarg and returns
+        {"items": [...], "after": cursor}. Stops early when the cursor runs out.
+        On a mid-run error, returns the items gathered so far with a
+        `partial_error` note (or the error itself if nothing was gathered).
+        """
+        all_items, seen, error = [], set(), None
+        after = kwargs.pop("after", None)
+        nsfw_hidden = 0
+        for _ in range(max(1, pages)):
+            result = method(after=after, **kwargs)
+            if "error" in result:
+                error = result
+                break
+            for item in result.get("items", []):
+                key = item.get("name") or item.get("id")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                all_items.append(item)
+            nsfw_hidden += result.get("nsfw_hidden", 0)
+            after = result.get("after")
+            if not after:
+                break
+        if error and not all_items:
+            return error
+        out = {"items": all_items, "after": after, "count": len(all_items)}
+        if nsfw_hidden:
+            out["nsfw_hidden"] = nsfw_hidden
+        if error:
+            out["partial_error"] = error.get("error", "unknown error")
+        return out
 
     # ── Trending / Popular ────────────────────────────────
 

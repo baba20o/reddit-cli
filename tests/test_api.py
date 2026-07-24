@@ -877,6 +877,88 @@ def test_morechildren_no_double_count_of_nested_stubs():
         assert result["more_count"] == 4
 
 
+# ── paginate() (feature: --pages) ─────────────────────────
+
+
+def _listing_page(ids, after):
+    children = [{"kind": "t3", "data": {**SAMPLE_POST["data"], "id": i, "name": f"t3_{i}"}}
+                for i in ids]
+    return {"kind": "Listing", "data": {"after": after, "children": children}}
+
+
+def test_paginate_merges_and_dedups():
+    client = _make_client()
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(_listing_page(["a", "b"], "t3_b")),
+            _mock_response(_listing_page(["b", "c"], None)),  # 'b' repeats across pages
+        ]
+        result = client.paginate(client.search, pages=3, query="x")
+        assert [i["id"] for i in result["items"]] == ["a", "b", "c"]
+        assert result["after"] is None
+        assert result["count"] == 3
+        assert mock_get.call_count == 2  # stopped at cursor exhaustion, not pages=3
+
+
+def test_paginate_single_page_matches_direct_call_shape():
+    client = _make_client()
+    with patch.object(client.session, "get", return_value=_mock_response(SAMPLE_LISTING)):
+        result = client.paginate(client.search, pages=1, query="x")
+        assert result["count"] == 1
+        assert result["after"] == "t3_next123"
+
+
+def test_paginate_partial_error_keeps_gathered_items():
+    client = _make_client()
+    err = MagicMock()
+    err.status_code = 404
+    err.headers = {}
+    with patch.object(client.session, "get") as mock_get:
+        mock_get.side_effect = [
+            _mock_response(_listing_page(["a"], "t3_a")),
+            err,
+        ]
+        result = client.paginate(client.search, pages=3, query="x")
+        assert [i["id"] for i in result["items"]] == ["a"]
+        assert "partial_error" in result
+        assert "error" not in result
+
+
+def test_paginate_error_on_first_page_propagates():
+    client = _make_client()
+    err = MagicMock()
+    err.status_code = 404
+    err.headers = {}
+    with patch.object(client.session, "get", return_value=err):
+        result = client.paginate(client.search, pages=2, query="x")
+        assert "error" in result
+
+
+# ── Multireddit fan-in (feature: -r a,b,c) ────────────────
+
+
+def test_search_normalizes_multireddit():
+    client = _make_client()
+    with patch.object(client.session, "get", return_value=_mock_response(SAMPLE_LISTING)) as mock_get:
+        client.search("x", subreddit="python, rust golang")
+        assert "/r/python+rust+golang/search" in mock_get.call_args[0][0]
+
+
+def test_subreddit_posts_normalizes_multireddit():
+    client = _make_client()
+    with patch.object(client.session, "get", return_value=_mock_response(SAMPLE_LISTING)) as mock_get:
+        client.subreddit_posts("a,b")
+        assert "/r/a+b/hot" in mock_get.call_args[0][0]
+
+
+def test_popular_subreddits_accepts_after():
+    client = _make_client()
+    sub_listing = {"kind": "Listing", "data": {"after": None, "children": [SAMPLE_SUBREDDIT]}}
+    with patch.object(client.session, "get", return_value=_mock_response(sub_listing)) as mock_get:
+        client.popular_subreddits(after="t5_abc")
+        assert mock_get.call_args[1]["params"]["after"] == "t5_abc"
+
+
 def test_post_comments_without_subreddit():
     client = _make_client()
     thread_response = [

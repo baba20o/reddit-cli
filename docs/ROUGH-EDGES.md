@@ -209,3 +209,50 @@ All six confirmed findings fixed:
   hid provably-fetched-and-truncated comments; clamp now floors at `truncated`.
 
 Suite after this round: 89 passed.
+
+---
+
+## Round 4 — agent-oriented features (2026-07-24)
+
+Built for agent/cron consumption (see README "Agent / scripting options"):
+`--pages` auto-pagination with dedup; `--jsonl` + `--fields` (15× measured
+context reduction on a 50-post search); `digest` one-shot recon command;
+`thread --author/--min-score`; `--since` + `--seen` delta tracking with a
+`seen` management command; multireddit fan-in (`-r a,b,c`, server-side);
+structured `{"error", "retryable"}` jsonl errors.
+
+Dogfooding fix during build:
+- [x] **F1. thread --jsonl leaked full selftext despite --fields** — post line
+  now projected too (warning-free for comment-only fields).
+
+### Verification round on the features (adversarial, 31 agents)
+
+Nine confirmed findings, all fixed:
+
+- [x] **F2. `--since` validated only after API spend (medium)** — a typo'd
+  value burned up to 10 rate-limited requests per run (forever, under cron).
+  Now validated eagerly via a click callback: fails in 0.2s with zero calls.
+- [x] **F3. Filtered threads asserted false reply structure (medium)** —
+  `--author`/`--min-score` survivors kept orphaned depths; a depth-2 reply
+  rendered as if nested under an unrelated comment. Filtered views now render
+  flat with an explicit "(filtered view — N hidden)" header.
+- [x] **F4. Five commands emitted cursors they couldn't accept** — user-posts,
+  user-comments, popular, find-subs, popular-subs advertised `_meta.after` but
+  had no `--after`. All five accept it now.
+- [x] **F5. SeenStore recycled long-lived items past the cap** — recency was
+  first-record; suppressed-but-visible items were never re-recorded, so hot
+  posts re-emitted as "new" after cap eviction. Now: last-occurrence dedup +
+  recording the pre-suppression list refreshes recency every run.
+- [x] **F6. SeenStore writes were non-atomic and unguarded** — crash mid-write
+  could wipe all stores; unwritable path gave a raw traceback after output.
+  Now temp-file + rename, and record failures warn on stderr (at-least-once).
+- [x] **F7. Empty-page renders dropped partial_error/filter notes** — a mid-run
+  429 with all items filtered looked like a clean "nothing new". Notes now
+  print in empty branches too.
+- [x] **F8. Markdown renderers missing the notes entirely** (same class as F7).
+- [x] **F9. digest silently dropped failed thread excerpts** — now noted in
+  markdown and as `skipped_threads` in `-j`.
+- [x] **F10. thread `filtered_out` invisible in human output** (folded into F3's
+  header; all-filtered threads say so instead of rendering empty).
+
+Suite after this round: 127 passed.

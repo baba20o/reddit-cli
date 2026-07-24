@@ -10,6 +10,8 @@ from reddit.cli import main
 def _invoke(args, client=None):
     """Run the CLI with a mocked RedditClient."""
     client = client or MagicMock()
+    # Commands route listings through paginate(); delegate to the stubbed method
+    client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
     with patch("reddit.cli.RedditClient", return_value=client):
         runner = CliRunner()
         return runner.invoke(main, args), client
