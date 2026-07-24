@@ -1362,8 +1362,10 @@ def topic():
               help="Max items per sweep")
 @click.option("--dir", "directory", default=None,
               help="Research folder (default: ./research/<name>)")
+@click.option("--media", "want_media", is_flag=True,
+              help="Also download attachments of new posts to <folder>/media/ on each update")
 @NSFW_FLAG
-def topic_create(name, subreddits, query, time_filter, limit, directory, include_nsfw):
+def topic_create(name, subreddits, query, time_filter, limit, directory, want_media, include_nsfw):
     """Create a standing topic."""
     name = _slug(name)
     store = TopicStore()
@@ -1378,12 +1380,14 @@ def topic_create(name, subreddits, query, time_filter, limit, directory, include
         "time": time_filter,
         "limit": limit,
         "nsfw": include_nsfw,
+        "media": want_media,
         "dir": resolved_dir,
         "created": time.time(),
         "updates": 0,
     })
     console.print(f"[green]Created topic '{name}'[/green] tracking r/{subreddits}"
-                  + (f" + query {query!r}" if query else ""))
+                  + (f" + query {query!r}" if query else "")
+                  + (" (+media)" if want_media else ""))
     console.print(f"[dim]Folder: {resolved_dir} — run: reddit topic update {name}[/dim]")
 
 
@@ -1397,7 +1401,8 @@ def topic_list():
     for name, cfg in sorted(topics.items()):
         last = _format_age(cfg.get("last_update", 0)) or "never"
         query = f" q={cfg['query']!r}" if cfg.get("query") else ""
-        console.print(f"[cyan]{name}[/cyan]: r/{cfg.get('subreddits', '?')}{query} "
+        tags = ("+media " if cfg.get("media") else "") + ("+nsfw " if cfg.get("nsfw") else "")
+        console.print(f"[cyan]{name}[/cyan]: r/{cfg.get('subreddits', '?')}{query} {tags}"
                       f"— {cfg.get('updates', 0)} update(s), last {last}")
         console.print(f"  [dim]{cfg.get('dir', '')}[/dim]")
 
@@ -1414,12 +1419,17 @@ def topic_remove(name):
     console.print(f"[green]Removed topic '{name}' (research folder kept)[/green]")
 
 
+TOPIC_MEDIA_MAX = 200  # per-update download cap for --media topics
+
+
 @topic.command(name="update")
 @click.argument("name")
+@click.option("--media/--no-media", "media_override", default=None,
+              help="Override the topic's media setting for this run")
 @click.option("--jsonl", is_flag=True, help="Emit delta items as jsonl on stdout")
 @common_options
 @click.pass_context
-def topic_update(ctx, name, jsonl, no_cache, debug):
+def topic_update(ctx, name, media_override, jsonl, no_cache, debug):
     """Fetch what's new for a topic and append it to its research folder."""
     name = _slug(name)  # same normalization as create, so names round-trip
     store = TopicStore()
@@ -1429,6 +1439,7 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
     client = _client(ctx, no_cache, debug)
     seen_key = f"topic:{name}"
     include_nsfw = cfg.get("nsfw", False)
+    want_media = cfg.get("media", False) if media_override is None else media_override
 
     posts_res = client.subreddit_posts(cfg["subreddits"], sort="new",
                                        limit=cfg.get("limit", 25), include_nsfw=include_nsfw)
@@ -1461,6 +1472,38 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
     nsfw_hidden = (posts_res.get("nsfw_hidden", 0) or 0) + \
                   ((search_res.get("nsfw_hidden", 0) or 0) if search_res else 0)
 
+    # Download attachments of the new posts (best-effort, once per post — the
+    # seen store already guarantees each post is a delta exactly once). Failures
+    # land in media/manifest.jsonl; posts are still marked reported. Posts whose
+    # media the per-update cap cut short are NOT recorded, so they re-appear as a
+    # delta next run and finish downloading (existing files skip) — self-healing.
+    media_counts = {}
+    media_truncated = False
+    media_deferred = set()   # post names to leave un-recorded (retry next run)
+    if want_media and total_new:
+        from reddit.media import MediaDownloader
+        downloader = None
+        try:
+            downloader = MediaDownloader(Path(cfg["dir"]) / "media", any_host=False)
+        except OSError as e:
+            click.echo(f"warning: could not prepare media dir: {e}", err=True)
+        if downloader is not None:
+            budget = TOPIC_MEDIA_MAX
+            for post in new_posts + new_hits:
+                if not post.get("media"):
+                    continue
+                if budget <= 0:  # cap hit — defer this post entirely
+                    media_truncated = True
+                    media_deferred.add(post.get("name"))
+                    continue
+                entries, dl, complete = downloader.download_post(post, budget=budget)
+                budget -= dl
+                for e in entries:
+                    media_counts[e["status"]] = media_counts.get(e["status"], 0) + 1
+                if not complete:  # gallery cut short by the cap
+                    media_truncated = True
+                    media_deferred.add(post.get("name"))
+
     def render_markdown():
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         click.echo(f"# topic: {name} — update {stamp}")
@@ -1475,6 +1518,11 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
                 {"items": new_hits, "count": len(new_hits),
                  "nsfw_hidden": search_res.get("nsfw_hidden", 0)},
                 f"New matches: {cfg['query']}")
+        if media_counts:
+            summary = ", ".join(f"{v} {k}" for k, v in sorted(media_counts.items()))
+            note = (f" — hit the {TOPIC_MEDIA_MAX}/update cap; the rest download next update"
+                    if media_truncated else "")
+            click.echo(f"\n_Media: {summary} → media/{note}_")
         if query_error:
             click.echo(f"\n_Query sweep failed this run: {query_error}_")
 
@@ -1495,6 +1543,10 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
         for item in new_hits:
             click.echo(_jsonl_line({**item, "topic_source": "search"}))
         meta = {"topic": name, "new": total_new}
+        if media_counts:
+            meta["media"] = media_counts
+        if media_truncated:
+            meta["media_truncated"] = True
         if nsfw_hidden:
             meta["nsfw_hidden"] = nsfw_hidden
         if query_error:
@@ -1502,6 +1554,10 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
         click.echo(_jsonl_line({"_meta": meta}))
     elif total_new:
         render_markdown()
+        if media_counts:
+            summary = ", ".join(f"{v} {k}" for k, v in sorted(media_counts.items()))
+            note = (f" (hit {TOPIC_MEDIA_MAX}/update cap; rest next run)" if media_truncated else "")
+            console.print(f"[dim]Media: {summary} → {Path(cfg['dir']) / 'media'}/{note}[/dim]")
     else:
         console.print(f"[dim]No new activity for topic '{name}'.[/dim]")
         if nsfw_hidden:
@@ -1512,8 +1568,11 @@ def topic_update(ctx, name, jsonl, no_cache, debug):
 
     for visible in (posts_visible, search_visible):
         if visible is not None:
+            # Deferred (cap-truncated) posts stay un-recorded so their media
+            # finishes downloading on the next update
+            items = [i for i in visible.get("items", []) if i.get("name") not in media_deferred]
             try:
-                SeenStore().record(seen_key, visible.get("items", []))
+                SeenStore().record(seen_key, items)
             except OSError as e:
                 click.echo(f"warning: could not update seen store: {e}", err=True)
     store.set(name, {**cfg, "last_update": time.time(), "updates": cfg.get("updates", 0) + 1})

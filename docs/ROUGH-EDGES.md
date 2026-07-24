@@ -346,3 +346,34 @@ unauthenticated session (OAuth token never touches a CDN).
   gallery overshoot of `--max-files` bounded (dup of M2's budget fix).
 
 Suite after this round: 180 passed.
+
+---
+
+## Round 7 — standing media (2026-07-24)
+
+Phase 2 of the media feature: `topic create --media` makes a standing topic
+download each new post's attachments into `<folder>/media/` on every `update`
+(`topic update --media/--no-media` overrides per run; `topic list` shows
+`+media`). The compounding payoff — a monitored subreddit now accumulates new
+posts *and* readable attachments automatically. Live-validated: `eink-watch`
+(r/eink, `--media`) downloaded new-post images on update 1, quiet on update 2;
+one downloaded image (a modded e-ink iPhone running a "Painter" app) read back
+cleanly.
+
+### Verification round (adversarial, 11 agents) — 2 root causes fixed
+
+- [x] **P1. Unguarded `mkdir` aborted the whole update (HIGH)** — a media-dir
+  failure (unwritable, full disk, or a file where `media/` should go) raised a
+  raw traceback *before* the delta report, save, and seen-recording, destroying
+  the command's primary function. Now guarded: warn and continue; the report
+  and delta tracking still run. Verified live (file blocking the media path →
+  full report still emitted).
+- [x] **P2. Budget cap silently dropped media forever (medium, flagged ×3)** — I
+  ignored `download_post`'s `complete` flag and marked cap-truncated posts as
+  seen, so their un-downloaded attachments never retried and `_meta` looked
+  complete. Now: truncation is surfaced (`media_truncated` in `_meta`, a note in
+  the update file and stdout) and self-heals — deferred posts stay un-recorded
+  so they re-appear as a delta next update and finish downloading (existing
+  files skip).
+
+Suite after this round: 186 passed.

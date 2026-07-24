@@ -313,6 +313,132 @@ def test_topic_nsfw_optin_passes_through(tmp_path, monkeypatch):
     assert client.subreddit_posts.call_args[1]["include_nsfw"] is True
 
 
+# ── topic --media (phase 2) ───────────────────────────────
+
+
+MEDIA_POST = {**POST_ITEM, "id": "m1", "name": "t3_m1",
+              "media": [{"url": "https://i.redd.it/m1.jpg", "type": "image"}]}
+
+
+def _invoke_topic_media(args, client, tmp_path):
+    """Like _invoke but also stubs the media downloader to write a dummy file."""
+    client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    runner = CliRunner(mix_stderr=False)
+    with patch("reddit.cli.RedditClient", return_value=client), \
+         patch("reddit.cli.SeenStore", lambda: SeenStore(str(tmp_path / "seen.json"))), \
+         patch("reddit.cli.TopicStore", lambda: TopicStore(str(tmp_path / "topics.json"))), \
+         patch("reddit.media.MediaDownloader._fetch") as mock_fetch:
+        def fake_fetch(url, path_hint):
+            p = path_hint("image/jpeg")
+            p.write_bytes(b"IMG")
+            return p, 3
+        mock_fetch.side_effect = fake_fetch
+        return runner.invoke(main, args), client
+
+
+def test_topic_create_media_flag_persisted(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    cfg = TopicStore(str(tmp_path / "topics.json")).get("vis")
+    assert cfg["media"] is True
+    result, _ = _invoke(["topic", "list"], tmp_path=tmp_path)
+    assert "+media" in result.output
+
+
+def test_topic_update_downloads_media(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    result, _ = _invoke_topic_media(["topic", "update", "vis", "--jsonl"], client, tmp_path)
+    assert result.exit_code == 0, result.output
+    # File landed in the topic's media/ folder
+    media_dir = tmp_path / "research" / "vis" / "media"
+    assert (media_dir / "m1-1.jpg").exists()
+    assert (media_dir / "manifest.jsonl").exists()
+    meta = json.loads(result.output.strip().splitlines()[-1])["_meta"]
+    assert meta["media"]["downloaded"] == 1
+
+
+def test_topic_update_media_only_for_new_posts(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    _invoke_topic_media(["topic", "update", "vis"], client, tmp_path)
+    # Second run: post already seen -> no new download attempt
+    client2 = MagicMock()
+    client2.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    with patch("reddit.media.MediaDownloader.download_post") as dp:
+        result, _ = _invoke(["topic", "update", "vis"], client2, tmp_path)
+        assert "No new activity" in result.output
+        assert dp.call_count == 0
+
+
+def test_topic_update_media_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    # Topic created WITHOUT media; --media overrides for one run
+    _invoke(["topic", "create", "vis", "-r", "eink"], tmp_path=tmp_path)
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    result, _ = _invoke_topic_media(["topic", "update", "vis", "--media"], client, tmp_path)
+    assert (tmp_path / "research" / "vis" / "media" / "m1-1.jpg").exists()
+
+    # And --no-media suppresses it on a media topic
+    _invoke(["topic", "create", "vis2", "-r", "eink", "--media"], tmp_path=tmp_path)
+    client2 = MagicMock()
+    client2.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    with patch("reddit.media.MediaDownloader.download_post") as dp:
+        _invoke(["topic", "update", "vis2", "--no-media"], client2, tmp_path)
+        assert dp.call_count == 0
+
+
+def test_topic_media_dir_failure_does_not_abort_update(tmp_path, monkeypatch):
+    """A media-dir failure must warn, not traceback — the delta report is primary."""
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    # Make the topic's media path un-creatable: put a FILE where media/ should go
+    media_path = tmp_path / "research" / "vis" / "media"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_text("i am a file, not a dir")
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    result, _ = _invoke_topic_media(["topic", "update", "vis", "--jsonl"], client, tmp_path)
+    assert result.exit_code == 0, result.output
+    # Delta report still emitted despite the media failure
+    lines = [json.loads(l) for l in result.output.strip().splitlines()]
+    assert lines[-1]["_meta"]["new"] == 1
+    assert "could not prepare media dir" in (result.stderr or "")
+
+
+def test_topic_media_cap_truncation_signalled_and_deferred(tmp_path, monkeypatch):
+    """Cap-truncated media must be flagged AND retried (post left un-seen)."""
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    # A gallery with more items than the (patched tiny) cap
+    big = {**POST_ITEM, "id": "big", "name": "t3_big",
+           "media": [{"url": f"https://i.redd.it/{i}.jpg", "type": "image"} for i in range(4)]}
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [big], "after": None, "count": 1}
+    with patch("reddit.cli.TOPIC_MEDIA_MAX", 2):
+        result, _ = _invoke_topic_media(["topic", "update", "vis", "--jsonl"], client, tmp_path)
+    meta = json.loads(result.output.strip().splitlines()[-1])["_meta"]
+    assert meta["media_truncated"] is True
+    # The post was NOT recorded as seen, so it retries next run
+    recorded = SeenStore(str(tmp_path / "seen.json")).names().get("topic:vis", 0)
+    assert recorded == 0
+
+    # Next run: post reappears as a delta; remaining images download
+    client2 = MagicMock()
+    client2.subreddit_posts.return_value = {"items": [big], "after": None, "count": 1}
+    with patch("reddit.cli.TOPIC_MEDIA_MAX", 200):
+        result2, _ = _invoke_topic_media(["topic", "update", "vis", "--jsonl"], client2, tmp_path)
+    meta2 = json.loads(result2.output.strip().splitlines()[-1])["_meta"]
+    assert meta2["new"] == 1  # reappeared
+    assert "media_truncated" not in meta2  # completed this time
+    assert SeenStore(str(tmp_path / "seen.json")).names()["topic:vis"] == 1
+
+
 def test_topic_store_roundtrip(tmp_path):
     store = TopicStore(str(tmp_path / "topics.json"))
     assert store.all() == {}

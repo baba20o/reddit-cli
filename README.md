@@ -96,8 +96,8 @@ reddit search "LLM" -m
 | Command | Description |
 |---------|-------------|
 | `reddit digest <subreddit>` | One-shot recon: info + top posts + thread excerpts (+ `-q` search) |
-| `reddit topic create <name> -r <subs> [-q query]` | Create a standing research topic |
-| `reddit topic update <name>` | Fetch only what's new for a topic, append to its research folder |
+| `reddit topic create <name> -r <subs> [-q query] [--media]` | Create a standing research topic |
+| `reddit topic update <name>` | Fetch only what's new for a topic, append to its research folder (+ attachments if `--media`) |
 | `reddit topic list` / `remove <name>` | Manage standing topics |
 | `reddit media <subreddit\|post-url>` | Download image/video attachments (galleries included) with a manifest |
 
@@ -176,7 +176,16 @@ reddit thread <url> --seen digi-jellyfin             # later: only NEW comments
 # 3. Make it standing: one command per check-in, deltas only
 reddit topic create digi-pres -r DataHoarder,Archiveteam -q "digital preservation"
 reddit topic update digi-pres        # appends new activity to research/digi-pres/
+
+# ...and have it collect the new posts' attachments too
+reddit topic create eink-watch -r eink --media
+reddit topic update eink-watch       # new posts -> research/eink-watch/media/
 ```
+
+A `--media` topic downloads each new post's attachments into
+`<folder>/media/` on every update (best-effort, once per post — failures land
+in `media/manifest.jsonl`; `topic update --media/--no-media` overrides the
+setting for one run).
 
 `--save TOPIC` on `search`/`comments`/`posts`/`thread`/`digest` appends the
 output (markdown, or jsonl with `--jsonl`) to `research/<TOPIC>/` (override the
