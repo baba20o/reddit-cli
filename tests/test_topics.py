@@ -439,6 +439,84 @@ def test_topic_media_cap_truncation_signalled_and_deferred(tmp_path, monkeypatch
     assert SeenStore(str(tmp_path / "seen.json")).names()["topic:vis"] == 1
 
 
+# ── topic INDEX.md (phase 3) ──────────────────────────────
+
+
+def test_topic_update_writes_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "-q", "reader"], tmp_path=tmp_path)
+    client = _topic_client([POST_ITEM])
+    _invoke(["topic", "update", "vis"], client, tmp_path)
+    index = (tmp_path / "research" / "vis" / "INDEX.md")
+    assert index.exists()
+    text = index.read_text()
+    assert "# vis — research index" in text
+    assert 'r/eink' in text and 'query "reader"' in text
+    # Links the update file that was just written
+    assert "-update.md)" in text
+
+
+def test_topic_index_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink"], tmp_path=tmp_path)
+    # No update yet -> nothing to index
+    result, _ = _invoke(["topic", "index", "vis"], tmp_path=tmp_path)
+    assert "Nothing to index" in result.output
+    # After an update, index regenerates on demand
+    _invoke(["topic", "update", "vis"], _topic_client([POST_ITEM]), tmp_path)
+    result, _ = _invoke(["topic", "index", "vis"], tmp_path=tmp_path)
+    assert "Wrote" in result.output
+    assert (tmp_path / "research" / "vis" / "INDEX.md").exists()
+
+
+def test_topic_index_unknown():
+    from reddit.cli import main
+    runner = CliRunner()
+    with patch("reddit.cli.TopicStore", lambda: TopicStore("/tmp/nonexistent-xyz.json")):
+        result = runner.invoke(main, ["topic", "index", "nope"])
+    assert result.exit_code == 1
+    assert "No topic named" in result.output
+
+
+def test_topic_index_survives_broken_media_symlink(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    _invoke_topic_media(["topic", "update", "vis"], client, tmp_path)
+    # Introduce a dangling symlink in media/ (points at a removed target)
+    media_dir = tmp_path / "research" / "vis" / "media"
+    (media_dir / "broken.jpg").symlink_to(media_dir / "does-not-exist.bin")
+    # Regeneration must not crash on the broken link
+    result, _ = _invoke(["topic", "index", "vis"], tmp_path=tmp_path)
+    assert result.exit_code == 0
+    assert "Wrote" in result.output
+
+
+def test_topic_index_lists_notes_separately(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink"], tmp_path=tmp_path)
+    _invoke(["topic", "update", "vis"], _topic_client([POST_ITEM]), tmp_path)
+    notes = tmp_path / "research" / "vis" / "NOTES.md"
+    notes.write_text("# my synthesis")
+    _invoke(["topic", "index", "vis"], tmp_path=tmp_path)
+    text = (tmp_path / "research" / "vis" / "INDEX.md").read_text()
+    assert "[NOTES.md](NOTES.md) — your synthesis" in text
+    # NOTES.md is not buried in the auto update list
+    assert "- [NOTES.md]" not in text and "NOTES.md)" in text
+
+
+def test_topic_index_counts_media(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDDIT_RESEARCH_DIR", str(tmp_path / "research"))
+    _invoke(["topic", "create", "vis", "-r", "eink", "--media"], tmp_path=tmp_path)
+    client = MagicMock()
+    client.subreddit_posts.return_value = {"items": [MEDIA_POST], "after": None, "count": 1}
+    _invoke_topic_media(["topic", "update", "vis"], client, tmp_path)
+    text = (tmp_path / "research" / "vis" / "INDEX.md").read_text()
+    assert "## Media" in text
+    assert "1 file(s)" in text
+
+
 def test_topic_store_roundtrip(tmp_path):
     store = TopicStore(str(tmp_path / "topics.json"))
     assert store.all() == {}

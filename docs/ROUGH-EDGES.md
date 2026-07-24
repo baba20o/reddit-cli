@@ -377,3 +377,39 @@ cleanly.
   files skip).
 
 Suite after this round: 186 passed.
+
+---
+
+## Round 8 — phase 3: audio muxing + research index (2026-07-24)
+
+Two capability upgrades:
+- **DASH audio muxing** — Reddit serves video and audio as separate tracks, so
+  downloaded video was silent. `MediaDownloader` now parses the DASH manifest
+  for the audio track, downloads it, and muxes with `ffmpeg` into one `.mp4`
+  with sound (falls back to video-only + a note when ffmpeg is absent or no
+  audio track exists). Live-validated: a real r/funny video downloaded with
+  both video and audio streams (`ffprobe` confirmed), manifest note "muxed with
+  audio".
+- **Topic INDEX.md** — every `topic update` regenerates `<folder>/INDEX.md`, a
+  single entry point linking each update/saved report (newest first) and
+  summarizing the media folder; `reddit topic index <name>` rebuilds on demand.
+
+### Verification round (adversarial, 20 agents) — 3 root causes fixed
+
+- [x] **X1. `ffmpeg` timeout orphaned `.mux.tmp.mp4` (flagged ×3)** — the
+  temp-cleanup `finally` unlinked the video/audio temps but not the mux output,
+  so a timed-out ffmpeg left a partial file that accumulated (and got counted
+  in INDEX's media summary). Now unlinked in `finally`; regression test with a
+  timeout-then-partial-write ffmpeg confirms zero leftover temps.
+- [x] **X2. Unguarded `stat()` crashed index generation (medium)** — a broken
+  symlink or a file removed mid-scan in `media/` raised `FileNotFoundError` out
+  of both `topic index` and `topic update` (after state was already persisted).
+  Per-file `stat()` now guarded.
+- [x] **X3. Manifest cap bounded compressed bytes → gzip bomb (low)** — reading
+  the DASH manifest via `raw.read(cap, decode_content=True)` capped *compressed*
+  input; a 2 MB gzip could inflate to ~2 GB. Now read via `iter_content` with a
+  decoded-byte counter, matching `_stream`'s discipline.
+- Cosmetic: NOTES.md is linked as the reader's synthesis instead of being
+  buried in the auto-generated update list.
+
+Suite after this round: 201 passed.

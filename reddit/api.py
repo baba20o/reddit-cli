@@ -81,7 +81,13 @@ def _extract_media(data: dict) -> list:
 
     video = ((data.get("secure_media") or data.get("media") or {}).get("reddit_video") or {})
     if video.get("fallback_url"):
-        return [{"url": video["fallback_url"], "type": "video"}]
+        # Reddit serves audio as a separate DASH track; carry has_audio + the
+        # manifest URL so the downloader can fetch and mux it (needs ffmpeg)
+        item = {"url": video["fallback_url"], "type": "video"}
+        if video.get("has_audio") and video.get("dash_url"):
+            item["has_audio"] = True
+            item["dash_url"] = video["dash_url"]
+        return [item]
 
     url = data.get("url") or ""
     host = urlparse(url).hostname or ""

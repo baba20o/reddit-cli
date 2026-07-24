@@ -1422,6 +1422,65 @@ def topic_remove(name):
 TOPIC_MEDIA_MAX = 200  # per-update download cap for --media topics
 
 
+def _write_topic_index(name: str, cfg: dict):
+    """Regenerate INDEX.md — a single entry point to a topic's accumulated
+    research: every update/saved file (newest first) plus a media summary."""
+    directory = Path(cfg["dir"])
+    if not directory.exists():
+        return None
+    # NOTES.md is the reader's own synthesis — link it separately, don't bury
+    # it in the auto-generated update list
+    docs = sorted((p for p in directory.glob("*.md")
+                   if p.name not in ("INDEX.md", "NOTES.md")), reverse=True)
+    saved = sorted((p for p in directory.glob("*.jsonl")), reverse=True)
+    has_notes = (directory / "NOTES.md").exists()
+    media_dir = directory / "media"
+    media_files = [p for p in media_dir.glob("*") if p.name != "manifest.jsonl"] \
+        if media_dir.exists() else []
+
+    def _size(p):
+        try:
+            return p.stat().st_size
+        except OSError:  # broken symlink or removed mid-scan
+            return 0
+
+    lines = [f"# {name} — research index", ""]
+    tracking = f"Tracking r/{cfg.get('subreddits', '?')}"
+    if cfg.get("query"):
+        tracking += f" · query \"{cfg['query']}\""
+    if cfg.get("media"):
+        tracking += " · +media"
+    lines.append(tracking)
+    lines.append(f"\n{cfg.get('updates', 0)} update(s). "
+                 f"Keep your own synthesis in NOTES.md.\n")
+
+    if has_notes:
+        lines.append("[NOTES.md](NOTES.md) — your synthesis\n")
+    if docs:
+        lines.append("## Updates & saved reports\n")
+        for p in docs:
+            label = p.stem  # e.g. 20260724-163535-update
+            lines.append(f"- [{label}]({p.name})")
+        lines.append("")
+    if saved:
+        lines.append("## Data (jsonl)\n")
+        for p in saved:
+            lines.append(f"- [{p.name}]({p.name})")
+        lines.append("")
+    if media_dir.exists():
+        total = sum(_size(p) for p in media_files)
+        lines.append("## Media\n")
+        lines.append(f"{len(media_files)} file(s), {total / 1024 / 1024:.1f} MB "
+                     f"in [media/](media/) — see [manifest](media/manifest.jsonl)\n")
+
+    index_path = directory / "INDEX.md"
+    try:
+        index_path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError:
+        return None
+    return index_path
+
+
 @topic.command(name="update")
 @click.argument("name")
 @click.option("--media/--no-media", "media_override", default=None,
@@ -1575,7 +1634,26 @@ def topic_update(ctx, name, media_override, jsonl, no_cache, debug):
                 SeenStore().record(seen_key, items)
             except OSError as e:
                 click.echo(f"warning: could not update seen store: {e}", err=True)
-    store.set(name, {**cfg, "last_update": time.time(), "updates": cfg.get("updates", 0) + 1})
+    updated_cfg = {**cfg, "last_update": time.time(), "updates": cfg.get("updates", 0) + 1}
+    store.set(name, updated_cfg)
+    _write_topic_index(name, updated_cfg)
+
+
+@topic.command(name="index")
+@click.argument("name")
+def topic_index(name):
+    """Regenerate a topic's INDEX.md (an entry point to its research folder)."""
+    name = _slug(name)
+    cfg = TopicStore().get(name)
+    if not cfg:
+        console.print(f"[yellow]No topic named '{name}'[/yellow]")
+        raise SystemExit(1)
+    path = _write_topic_index(name, cfg)
+    if path:
+        console.print(f"[green]Wrote {path}[/green]")
+    else:
+        console.print(f"[yellow]Nothing to index yet for '{name}' "
+                      f"(no research folder — run an update first)[/yellow]")
 
 
 @main.command()

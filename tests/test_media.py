@@ -1,6 +1,7 @@
 """Tests for media extraction (api._extract_media) and MediaDownloader."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -278,6 +279,143 @@ def test_extract_crosspost_uses_parent():
             "crosspost_parent_list": [
                 {"url": "https://i.redd.it/parent.jpg"}]}
     assert _extract_media(data) == [{"url": "https://i.redd.it/parent.jpg", "type": "image"}]
+
+
+# ── Audio muxing (phase 3) ────────────────────────────────
+
+
+def test_extract_video_carries_audio_info():
+    data = {"url": "https://v.redd.it/x", "secure_media": {"reddit_video": {
+        "fallback_url": "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+        "has_audio": True, "dash_url": "https://v.redd.it/x/DASHPlaylist.mpd?a=sig"}}}
+    item = _extract_media(data)[0]
+    assert item["type"] == "video"
+    assert item["has_audio"] is True
+    assert "DASHPlaylist" in item["dash_url"]
+
+
+def test_extract_video_without_audio_omits_fields():
+    data = {"url": "https://v.redd.it/x", "secure_media": {"reddit_video": {
+        "fallback_url": "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+        "has_audio": False}}}
+    item = _extract_media(data)[0]
+    assert "has_audio" not in item
+
+
+def test_resolve_audio_url_from_manifest(tmp_path):
+    d = _downloader(tmp_path)
+    manifest = (
+        '<MPD><AdaptationSet contentType="video">'
+        '<Representation><BaseURL>CMAF_480.mp4</BaseURL></Representation></AdaptationSet>'
+        '<AdaptationSet contentType="audio">'
+        '<Representation><BaseURL>CMAF_AUDIO_64.mp4</BaseURL></Representation>'
+        '<Representation><BaseURL>CMAF_AUDIO_128.mp4</BaseURL></Representation>'
+        '</AdaptationSet></MPD>')
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.iter_content = lambda chunk_size: iter([manifest.encode()])
+    resp.__enter__ = lambda self: self
+    resp.__exit__ = MagicMock(return_value=False)
+    with patch.object(d.session, "get", return_value=resp):
+        audio = d._resolve_audio_url(
+            "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+            "https://v.redd.it/x/DASHPlaylist.mpd?a=sig")
+    # Highest-bitrate audio track, resolved against the video base
+    assert audio == "https://v.redd.it/x/CMAF_AUDIO_128.mp4"
+
+
+def test_resolve_audio_url_rejects_disallowed_dash_host(tmp_path):
+    d = _downloader(tmp_path)
+    assert d._resolve_audio_url("https://v.redd.it/x/v.mp4",
+                                "https://evil.example/manifest.mpd") is None
+
+
+def test_video_muxed_falls_back_to_video_only_without_audio(tmp_path):
+    """No audio resolvable -> video-only file, muxed=False, no crash."""
+    d = _downloader(tmp_path)
+    video_resp = _mock_response(b"VIDEODATA", "video/mp4")
+    with patch.object(d.session, "get", return_value=video_resp), \
+         patch.object(d, "_resolve_audio_url", return_value=None):
+        written, muxed = d._fetch_video_muxed(
+            "https://v.redd.it/x/CMAF_480.mp4?source=fallback", "", tmp_path / "media" / "v.mp4")
+    assert muxed is False
+    assert (tmp_path / "media" / "v.mp4").read_bytes() == b"VIDEODATA"
+    assert not list((tmp_path / "media").glob("*.tmp*"))  # temps cleaned up
+
+
+def test_video_muxed_note_when_muxed(tmp_path):
+    d = _downloader(tmp_path)
+    post = {**POST, "media": [{"url": "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+                               "type": "video", "has_audio": True,
+                               "dash_url": "https://v.redd.it/x/DASHPlaylist.mpd?a=s"}]}
+    with patch.object(d, "_fetch_video_muxed", return_value=(1234, True)):
+        entries = _post(d, post)
+    assert entries[0]["status"] == "downloaded"
+    assert entries[0]["note"] == "muxed with audio"
+
+
+def test_video_muxed_cleans_out_tmp_on_timeout(tmp_path):
+    """ffmpeg timeout must not orphan a .mux.tmp.mp4 in the dest dir."""
+    import subprocess as sp
+    d = _downloader(tmp_path)
+    video_resp = _mock_response(b"VID", "video/mp4")
+    audio_resp = _mock_response(b"AUD", "audio/mp4")
+
+    def get(url, **kw):
+        return audio_resp if "AUDIO" in url else video_resp
+
+    def fake_run(args, **kw):
+        # ffmpeg opens the -y output early, then hangs past the timeout
+        Path(args[-1]).write_bytes(b"PARTIAL")
+        raise sp.TimeoutExpired(args, kw.get("timeout", 1))
+
+    with patch("reddit.media.ffmpeg_path", return_value="/usr/bin/ffmpeg"), \
+         patch.object(d, "_resolve_audio_url",
+                      return_value="https://v.redd.it/x/CMAF_AUDIO_128.mp4"), \
+         patch.object(d.session, "get", side_effect=get), \
+         patch("reddit.media.subprocess.run", side_effect=fake_run):
+        written, muxed = d._fetch_video_muxed(
+            "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+            "https://v.redd.it/x/DASHPlaylist.mpd?a=s", tmp_path / "media" / "v.mp4")
+    assert muxed is False
+    assert (tmp_path / "media" / "v.mp4").read_bytes() == b"VID"  # salvaged
+    assert list((tmp_path / "media").glob("*.tmp*")) == []  # NO orphaned mux temp
+
+
+def test_resolve_audio_url_caps_decoded_manifest(tmp_path):
+    """A gzip-inflated manifest larger than the cap must be rejected, not OOM."""
+    d = _downloader(tmp_path)
+    big = b"<x>" * (2 * 1024 * 1024)  # > MANIFEST_MAX_BYTES when concatenated
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.iter_content = lambda chunk_size: iter([big, big])
+    resp.__enter__ = lambda self: self
+    resp.__exit__ = MagicMock(return_value=False)
+    with patch.object(d.session, "get", return_value=resp):
+        assert d._resolve_audio_url("https://v.redd.it/x/v.mp4",
+                                    "https://v.redd.it/x/m.mpd") is None
+
+
+def test_video_muxed_cleans_temps_on_ffmpeg_failure(tmp_path):
+    d = _downloader(tmp_path)
+    video_resp = _mock_response(b"VID", "video/mp4")
+    audio_resp = _mock_response(b"AUD", "audio/mp4")
+
+    def get(url, **kw):
+        return audio_resp if "AUDIO" in url else video_resp
+
+    fail = MagicMock(returncode=1)
+    with patch("reddit.media.ffmpeg_path", return_value="/usr/bin/ffmpeg"), \
+         patch.object(d, "_resolve_audio_url",
+                      return_value="https://v.redd.it/x/CMAF_AUDIO_128.mp4"), \
+         patch.object(d.session, "get", side_effect=get), \
+         patch("reddit.media.subprocess.run", return_value=fail):
+        written, muxed = d._fetch_video_muxed(
+            "https://v.redd.it/x/CMAF_480.mp4?source=fallback",
+            "https://v.redd.it/x/DASHPlaylist.mpd?a=s", tmp_path / "media" / "v.mp4")
+    assert muxed is False  # ffmpeg failed -> video-only salvage
+    assert (tmp_path / "media" / "v.mp4").read_bytes() == b"VID"
+    assert not list((tmp_path / "media").glob("*.tmp*"))
 
 
 # ── CLI integration ───────────────────────────────────────

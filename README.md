@@ -98,7 +98,7 @@ reddit search "LLM" -m
 | `reddit digest <subreddit>` | One-shot recon: info + top posts + thread excerpts (+ `-q` search) |
 | `reddit topic create <name> -r <subs> [-q query] [--media]` | Create a standing research topic |
 | `reddit topic update <name>` | Fetch only what's new for a topic, append to its research folder (+ attachments if `--media`) |
-| `reddit topic list` / `remove <name>` | Manage standing topics |
+| `reddit topic list` / `remove <name>` / `index <name>` | Manage standing topics |
 | `reddit media <subreddit\|post-url>` | Download image/video attachments (galleries included) with a manifest |
 
 ### Utility
@@ -185,7 +185,10 @@ reddit topic update eink-watch       # new posts -> research/eink-watch/media/
 A `--media` topic downloads each new post's attachments into
 `<folder>/media/` on every update (best-effort, once per post — failures land
 in `media/manifest.jsonl`; `topic update --media/--no-media` overrides the
-setting for one run).
+setting for one run). Every update also regenerates `<folder>/INDEX.md` — a
+single entry point linking each update/saved report (newest first) and
+summarizing the media folder; `reddit topic index <name>` rebuilds it on
+demand.
 
 `--save TOPIC` on `search`/`comments`/`posts`/`thread`/`digest` appends the
 output (markdown, or jsonl with `--jsonl`) to `research/<TOPIC>/` (override the
@@ -211,9 +214,13 @@ Reddit/imgur CDNs only by default (`--any-host` relaxes to media-extension
 URLs on any https host), content-type verified (an HTML error page never gets
 saved as `.jpg`), per-file size cap (`--max-size`, 50MB default) enforced
 mid-stream, `--max-files` run cap, NSFW excluded unless `--nsfw`, and re-runs
-skip existing files. Reddit-hosted video is the DASH fallback stream (no audio
-track). Media fetches use a separate unauthenticated session — your OAuth
-token never touches a CDN.
+skip existing files. Media fetches use a separate unauthenticated session —
+your OAuth token never touches a CDN.
+
+Reddit-hosted video is served as separate DASH video and audio tracks; if
+[ffmpeg](https://ffmpeg.org/) is on `PATH` the two are muxed into one `.mp4`
+with sound (the manifest note reads "muxed with audio"). Without ffmpeg you
+get the video-only stream and a note saying so.
 
 ### Thread options
 
