@@ -131,6 +131,14 @@ def _format_post(post: dict) -> dict:
         "link_flair_text": data.get("link_flair_text") or "",
         "over_18": data.get("over_18", False),
         "stickied": data.get("stickied", False),
+        # Signals Reddit already sends — surfaced for filtering/indicators
+        "awards": data.get("total_awards_received") or 0,
+        "edited": bool(data.get("edited")),  # false or an epoch timestamp
+        "locked": data.get("locked", False),
+        "spoiler": data.get("spoiler", False),
+        "distinguished": data.get("distinguished") or "",  # moderator/admin
+        "is_oc": data.get("is_original_content", False),
+        "num_crossposts": data.get("num_crossposts") or 0,
         "media": _extract_media(data),
     }
 
@@ -200,6 +208,20 @@ _BARE_URL_RE = re.compile(r"reddit\.com/(?:comments|gallery)/(?P<id>[a-zA-Z0-9]+
 _SHORTLINK_RE = re.compile(r"(?<![.\w])redd\.it/(?P<id>[a-zA-Z0-9]+)")
 # Mobile-app share links; the token is opaque and only resolves via HTTP redirect
 _SHARE_LINK_RE = re.compile(r"reddit\.com/r/[^/\s]+/s/[A-Za-z0-9]+")
+
+
+def is_share_link(ref: str) -> bool:
+    return bool(_SHARE_LINK_RE.search(ref or ""))
+
+
+def _is_reddit_host(url: str) -> bool:
+    """True only for https URLs on reddit.com (or a subdomain)."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "reddit.com" or host.endswith(".reddit.com"))
 
 
 def parse_post_reference(target: str, post_id: Optional[str] = None) -> Tuple[Optional[str], str]:
@@ -535,6 +557,102 @@ class RedditClient:
         if "error" in result:
             return result
         return _format_subreddit(result)
+
+    def subreddit_rules(self, subreddit: str) -> dict:
+        """Get a subreddit's posting rules."""
+        result = self._get(f"/r/{subreddit}/about/rules", {})
+        if "error" in result:
+            return result
+        rules = []
+        for r in result.get("rules", []):
+            rules.append({
+                "name": r.get("short_name", ""),
+                "description": r.get("description", ""),
+                "violation_reason": r.get("violation_reason", ""),
+                "kind": r.get("kind", ""),  # link, comment, or all
+            })
+        return {"rules": rules, "count": len(rules)}
+
+    def subreddit_moderators(self, subreddit: str) -> dict:
+        """Get a subreddit's moderator list."""
+        result = self._get(f"/r/{subreddit}/about/moderators", {})
+        if "error" in result:
+            return result
+        mods = []
+        for m in result.get("data", {}).get("children", []):
+            mods.append({
+                "name": m.get("name", ""),
+                "mod_permissions": m.get("mod_permissions", []),
+            })
+        return {"moderators": mods, "count": len(mods)}
+
+    def related_subreddits(self, subreddit: str, limit: int = 25) -> dict:
+        """Find subreddits Reddit associates with the given one."""
+        about = self._get(f"/r/{subreddit}/about", {})
+        if "error" in about:
+            return about
+        fullname = about.get("data", {}).get("name", "")
+        if not fullname:
+            return {"error": f"Could not resolve r/{subreddit}", "items": [], "count": 0}
+        result = self._get("/api/similar_subreddits", {"sr_fullnames": fullname})
+        parsed = self._parse_listing(result, item_type="sr")
+        parsed["items"] = parsed.get("items", [])[:limit]
+        parsed["count"] = len(parsed["items"])
+        return parsed
+
+    def duplicates(self, post_id: str, subreddit: Optional[str] = None, limit: int = 25) -> dict:
+        """Get crossposts/duplicate submissions of a link (the original + reposts)."""
+        result = self._get(f"/duplicates/{post_id}", {"limit": min(limit, 100)})
+        if "error" in result:
+            return result
+        if not (isinstance(result, list) and len(result) >= 2):
+            return {"error": "Unexpected response format", "original": {}, "items": []}
+        orig_children = result[0].get("data", {}).get("children", [])
+        dup_children = result[1].get("data", {}).get("children", [])
+        original = _format_post(orig_children[0]) if orig_children else {}
+        items = [_format_post(c) for c in dup_children if c.get("kind") == "t3"]
+        return {"original": original, "items": items, "count": len(items)}
+
+    def info_by_fullnames(self, fullnames, include_nsfw: bool = True) -> dict:
+        """Bulk-hydrate links/comments/subreddits by fullname (t3_/t1_/t5_).
+
+        One request for many ids — cheaper than fetching each separately.
+        """
+        if isinstance(fullnames, (list, tuple)):
+            fullnames = ",".join(fullnames)
+        result = self._get("/api/info", {"id": fullnames})
+        # item_type=None -> dispatch by each child's kind (mixed t3/t1/t5)
+        return _filter_nsfw(self._parse_listing(result, item_type=None), include_nsfw)
+
+    def resolve_post_reference(self, target: str, post_id: Optional[str] = None) -> Tuple[Optional[str], str]:
+        """Like parse_post_reference, but follows /s/ mobile share links over
+        the network to their canonical permalink first."""
+        if post_id is None and is_share_link(target):
+            target = self._follow_share_link(target)
+        return parse_post_reference(target, post_id)
+
+    def _follow_share_link(self, url: str) -> str:
+        """Follow a share-link redirect to the real permalink.
+
+        Validates the host is https reddit.com BEFORE the request (a share-link
+        substring can appear inside a hostile URL — SSRF) and re-validates the
+        final host after redirects. Uses a clean request (no OAuth bearer — the
+        token must not leak to a third-party host)."""
+        if not _is_reddit_host(url):
+            raise ValueError(f"refusing to resolve non-Reddit URL {url!r}")
+        try:
+            resp = requests.get(
+                url, allow_redirects=True, stream=True,
+                timeout=(10, REQUEST_TIMEOUT),
+                headers={"User-Agent": self.session.headers["User-Agent"]},
+            )
+            final = resp.url
+            resp.close()
+        except requests.RequestException as e:
+            raise ValueError(f"could not resolve share link {url!r}: {e}")
+        if not _is_reddit_host(final) or is_share_link(final) or "/comments/" not in final:
+            raise ValueError(f"share link {url!r} did not resolve to a Reddit post")
+        return final
 
     # ── Post & Comments ───────────────────────────────────
 

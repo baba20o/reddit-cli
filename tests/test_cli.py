@@ -12,6 +12,8 @@ def _invoke(args, client=None):
     client = client or MagicMock()
     # Commands route listings through paginate(); delegate to the stubbed method
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     with patch("reddit.cli.RedditClient", return_value=client):
         runner = CliRunner()
         return runner.invoke(main, args), client

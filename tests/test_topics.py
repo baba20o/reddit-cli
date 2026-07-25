@@ -21,6 +21,8 @@ def _invoke(args, client=None, tmp_path=None):
     """Run the CLI with mocked client and (optionally) tmp seen/topic stores."""
     client = client or MagicMock()
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     runner = CliRunner(mix_stderr=False)  # keep stdout parseable as jsonl
     ctxs = [patch("reddit.cli.RedditClient", return_value=client)]
     if tmp_path is not None:
@@ -323,6 +325,8 @@ MEDIA_POST = {**POST_ITEM, "id": "m1", "name": "t3_m1",
 def _invoke_topic_media(args, client, tmp_path):
     """Like _invoke but also stubs the media downloader to write a dummy file."""
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     runner = CliRunner(mix_stderr=False)
     with patch("reddit.cli.RedditClient", return_value=client), \
          patch("reddit.cli.SeenStore", lambda: SeenStore(str(tmp_path / "seen.json"))), \

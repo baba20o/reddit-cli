@@ -413,3 +413,46 @@ Two capability upgrades:
   buried in the auto-generated update list.
 
 Suite after this round: 201 passed.
+
+---
+
+## Round 9 — API enrichment (2026-07-25)
+
+After fetching the Reddit API docs (via PRAW/Pyprohly mirrors + live probing of
+every candidate endpoint), added the read-only endpoints that compound
+research:
+- **`reddit related <sub>`** — Reddit's associated-subreddit cluster
+  (`/api/similar_subreddits`); a new discovery vector beyond name search.
+- **`reddit crossposts <url>`** — where else a post was shared and how each
+  community reacted (`/duplicates/{id}`).
+- **`reddit get <id>…`** — bulk-hydrate posts/comments/subreddits in one
+  request (`/api/info`).
+- **`info --rules/--mods`** and **`digest --rules/--related`** — surface a
+  community's rules and moderators.
+- **`posts/search --flair/--oc`** filters; **surfaced post fields** already in
+  every response (awards, edited, locked, spoiler, distinguished, is_oc,
+  num_crossposts) as `[OC]`/`[locked]`/`[🏆]` tags + jsonl fields.
+- **`/s/` mobile share-link resolution** — the long-standing "paste and it
+  errors" limitation now follows the redirect to the real permalink
+  (`thread`/`media`/`crossposts`).
+
+### Verification round (adversarial, 12 agents) — 3 confirmed, all fixed
+
+- [x] **E1. SSRF via unanchored share-link match (HIGH)** — `is_share_link`
+  used `.search()`, so a hostile URL merely *containing* `reddit.com/r/x/s/y`
+  (e.g. `http://169.254.169.254/…?x=reddit.com/r/a/s/b`) passed the gate and
+  `_follow_share_link` issued a GET to the internal host. Same class as the
+  media-downloader SSRF. Fixed: validate scheme+host are `https` Reddit BEFORE
+  the request and re-validate the final host after redirects; verified the
+  metadata URL is now rejected with zero requests issued.
+- [x] **E2. `get` mangled t1_/t5_ fullnames (medium)** — `info_by_fullnames`
+  parsed every child as a post (`_parse_listing` defaulted `item_type="link"`),
+  so a comment lost its body and a subreddit lost its metadata. Now dispatches
+  by each child's kind; live-confirmed a t1_ keeps its body and a t5_ parses as
+  a subreddit.
+- [x] **E3. `info_by_url` was dead code** — defined, never wired, and carried
+  the same mis-parse bug. Removed.
+- Also: reverted a stray CRLF→LF normalization of test_api.py (editor noise) to
+  keep the commit to real changes.
+
+Suite after this round: 223 passed.

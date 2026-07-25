@@ -66,15 +66,18 @@ reddit search "LLM" -m
 | `reddit search <query>` | Search posts by relevance |
 | `reddit comments <query>` | Search comments |
 | `reddit find-subs <query>` | Find subreddits by name/description |
+| `reddit related <subreddit>` | Subreddits Reddit associates with this one (discovery cluster) |
+| `reddit crossposts <url\|id>` | Where else a post was shared, and how each community reacted |
+| `reddit get <id> [<id>...]` | Bulk-fetch posts by fullname/id in one request |
 
 ### Subreddit
 
 | Command | Description |
 |---------|-------------|
 | `reddit posts <subreddit>` | Get posts (hot, new, top, rising, controversial) |
-| `reddit info <subreddit>` | Subreddit metadata (subscribers, description) |
+| `reddit info <subreddit>` | Subreddit metadata; `--rules`/`--mods` add rules and moderators |
 | `reddit thread <subreddit> <post_id>` | Post with its comment tree (replies included) |
-| `reddit thread <url>` | Same, from a pasted permalink, redd.it link, t3_ fullname, or bare id |
+| `reddit thread <url>` | Same, from a permalink, redd.it link, mobile `/s/` share link, t3_ fullname, or bare id |
 
 ### User
 
@@ -142,6 +145,9 @@ tracking:
 | `-r a,b,c` | Multireddit fan-in: searches/lists `r/a+b+c` server-side in one request |
 | `thread --author X` | Only X's comments in a thread (e.g. mine an OP's answers) |
 | `thread --min-score N` | Drop low-signal comments before they cost tokens |
+| `posts/search --flair X` | Only posts whose flair contains X (case-insensitive) |
+| `posts/search --oc` | Only original-content (OC) posts |
+| `digest --rules --related` | Add posting rules and related subreddits to a recon digest |
 
 ```bash
 # 100 dense records, 4 pages merged, only the fields you need
@@ -160,6 +166,11 @@ reddit thread <url> -n 200 --author some_op --jsonl
 Reddit's native search operators pass through unchanged: `author:name`,
 `self:yes`, `flair:"Discussion"`, `title:foo`, and boolean `OR` all work inside
 the query string.
+
+Every post now carries signal fields in `-j`/`--jsonl` output —
+`awards`, `edited`, `locked`, `spoiler`, `distinguished`, `is_oc`,
+`num_crossposts` — surfaced as compact `[OC]`/`[locked]`/`[spoiler]`/`[N🏆]`
+tags in table view.
 
 ### Research workflow
 

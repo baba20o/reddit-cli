@@ -427,6 +427,8 @@ from reddit.cli import main
 
 def _invoke_media(args, client, tmp_path):
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     runner = CliRunner(mix_stderr=False)
     with patch("reddit.cli.RedditClient", return_value=client):
         with patch("reddit.media.MediaDownloader._fetch") as mock_fetch:
@@ -508,8 +510,10 @@ def test_media_all_failed_exits_nonzero(tmp_path):
     # skipped != failed, so use a failing allowed host instead
     client.subreddit_posts.return_value = {"items": [POST], "after": None, "count": 1}
     runner = CliRunner(mix_stderr=False)
+    client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     with patch("reddit.cli.RedditClient", return_value=client):
-        client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
         with patch("reddit.media.MediaDownloader._fetch",
                    side_effect=ValueError("not media (Content-Type: text/html)")):
             result = runner.invoke(main, ["media", "sub", "--dir", str(tmp_path / "dl")])

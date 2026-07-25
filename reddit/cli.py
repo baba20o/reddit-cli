@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from reddit.api import RedditClient, SORT_CHOICES, TIME_CHOICES, parse_post_reference
+from reddit.api import RedditClient, SORT_CHOICES, TIME_CHOICES
 from reddit.cache import SeenStore
 from reddit.topics import TopicStore
 
@@ -97,6 +97,30 @@ def _apply_since(result: dict, since: str) -> dict:
     return result
 
 
+def filter_options(f):
+    """Client-side post filters for listing commands."""
+    f = click.option("--flair", default=None,
+                     help="Only posts whose flair contains this text (case-insensitive)")(f)
+    f = click.option("--oc", is_flag=True, help="Only original-content (OC) posts")(f)
+    return f
+
+
+def _apply_post_filters(result: dict, flair: str, oc: bool) -> dict:
+    if "error" in result or not (flair or oc):
+        return result
+    items = result.get("items", [])
+    kept = items
+    if flair:
+        needle = flair.lower()
+        kept = [i for i in kept if needle in (i.get("link_flair_text") or "").lower()]
+    if oc:
+        kept = [i for i in kept if i.get("is_oc")]
+    if len(kept) != len(items):
+        result = {**result, "items": kept, "count": len(kept),
+                  "post_filtered": len(items) - len(kept)}
+    return result
+
+
 def _apply_seen(result: dict, seen_name: str) -> dict:
     if not seen_name or "error" in result:
         return result
@@ -143,7 +167,8 @@ def _emit_structured(result: dict, jsonl: bool, json_output: bool, fields: str) 
         for item in _project(result.get("items", []), fields):
             click.echo(_jsonl_line(item))
         meta = {k: result[k] for k in
-                ("after", "count", "nsfw_hidden", "since_filtered", "seen_filtered", "partial_error")
+                ("after", "count", "nsfw_hidden", "since_filtered", "seen_filtered",
+                 "post_filtered", "partial_error")
                 if k in result and result[k] is not None}
         click.echo(_jsonl_line({"_meta": meta}))
         return True
@@ -229,6 +254,8 @@ def _filter_notes(result: dict) -> list:
         notes.append(f"{result['since_filtered']} older result(s) filtered (--since)")
     if result.get("seen_filtered"):
         notes.append(f"{result['seen_filtered']} previously-seen result(s) skipped (--seen)")
+    if result.get("post_filtered"):
+        notes.append(f"{result['post_filtered']} result(s) filtered (--flair/--oc)")
     if result.get("partial_error"):
         notes.append(f"pagination stopped early: {result['partial_error']}")
     return notes
@@ -363,8 +390,19 @@ def _render_posts(result: dict, title: str) -> None:
 
     for item in items:
         item_title = escape(item.get("title", "").replace("\n", " "))
+        tags = []
         if item.get("over_18"):
-            item_title = f"[red reverse]NSFW[/red reverse] {item_title}"
+            tags.append("[red reverse]NSFW[/red reverse]")
+        if item.get("spoiler"):
+            tags.append("[yellow]\\[spoiler][/yellow]")
+        if item.get("locked"):
+            tags.append("[dim]\\[locked][/dim]")
+        if item.get("is_oc"):
+            tags.append("[green]\\[OC][/green]")
+        if item.get("awards"):
+            tags.append(f"[magenta]\\[{item['awards']}🏆][/magenta]")
+        if tags:
+            item_title = f"{' '.join(tags)} {item_title}"
         table.add_row(
             f"r/{escape(item.get('subreddit', ''))}",
             item_title,
@@ -560,6 +598,33 @@ def _render_subreddit_detail_markdown(info: dict) -> None:
     click.echo(f"\n{info.get('description', 'N/A')}")
 
 
+def _render_rules(result: dict, markdown: bool = False) -> None:
+    rules = result.get("rules", [])
+    if markdown:
+        click.echo(f"\n### Rules ({len(rules)})\n")
+        for i, r in enumerate(rules, 1):
+            scope = f" _[{r['kind']}]_" if r.get("kind") and r["kind"] != "all" else ""
+            click.echo(f"{i}. **{_escape_md(r.get('name', ''))}**{scope}"
+                       + (f" — {_escape_md(_truncate(r.get('description', ''), 200))}"
+                          if r.get("description") else ""))
+        return
+    console.print(f"\n[bold]Rules ({len(rules)}):[/bold]")
+    for i, r in enumerate(rules, 1):
+        scope = f" [dim]\\[{r['kind']}][/dim]" if r.get("kind") and r["kind"] != "all" else ""
+        console.print(f"  [cyan]{i}.[/cyan] {escape(r.get('name', ''))}{scope}")
+        if r.get("description"):
+            console.print(f"     [dim]{escape(_truncate(r['description'], 160))}[/dim]")
+
+
+def _render_mods(result: dict, markdown: bool = False) -> None:
+    mods = result.get("moderators", [])
+    names = ", ".join(f"u/{m.get('name', '')}" for m in mods)
+    if markdown:
+        click.echo(f"\n### Moderators ({len(mods)})\n\n{names}")
+    else:
+        console.print(f"\n[bold]Moderators ({len(mods)}):[/bold] [green]{escape(names)}[/green]")
+
+
 def _render_user(info: dict) -> None:
     lines = [
         f"[bold]Username:[/bold] u/{info.get('username', 'N/A')}",
@@ -712,6 +777,7 @@ def main(ctx, debug, no_cache):
 @click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True, help="Max results per page (1-100)")
 @click.option("--after", default=None, help="Pagination cursor")
 @listing_options
+@filter_options
 @NSFW_FLAG
 @SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")
@@ -720,7 +786,7 @@ def main(ctx, debug, no_cache):
 @common_options
 @click.pass_context
 def search(ctx, query, subreddit, sort, time_filter, limit, after, pages, since, seen_name,
-           include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
+           flair, oc, include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Search Reddit posts.
 
     The query passes through Reddit's search operators untouched:
@@ -732,7 +798,7 @@ def search(ctx, query, subreddit, sort, time_filter, limit, after, pages, since,
                              include_nsfw=include_nsfw)
     if _error_exit(result, jsonl):
         return
-    result = _apply_since(result, since)
+    result = _apply_post_filters(_apply_since(result, since), flair, oc)
     visible_for_seen = result  # suppressed-but-still-visible items refresh recency
     result = _apply_seen(result, seen_name)
     if save_topic:
@@ -792,6 +858,7 @@ def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, pages, 
 @click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True)
 @click.option("--after", default=None)
 @listing_options
+@filter_options
 @NSFW_FLAG
 @SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
@@ -800,7 +867,7 @@ def comments_cmd(ctx, query, subreddit, sort, time_filter, limit, after, pages, 
 @common_options
 @click.pass_context
 def posts(ctx, subreddit, sort, time_filter, limit, after, pages, since, seen_name,
-          include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
+          flair, oc, include_nsfw, save_topic, json_output, markdown, jsonl, fields, no_cache, debug):
     """Get posts from a subreddit (hot, new, top, rising, controversial).
 
     SUBREDDIT may be comma-separated (a+b multireddit fan-in, server-side).
@@ -811,7 +878,7 @@ def posts(ctx, subreddit, sort, time_filter, limit, after, pages, since, seen_na
                              include_nsfw=include_nsfw)
     if _error_exit(result, jsonl):
         return
-    result = _apply_since(result, since)
+    result = _apply_post_filters(_apply_since(result, since), flair, oc)
     visible_for_seen = result  # suppressed-but-still-visible items refresh recency
     result = _apply_seen(result, seen_name)
     if save_topic:
@@ -825,25 +892,110 @@ def posts(ctx, subreddit, sort, time_filter, limit, after, pages, since, seen_na
 
 @main.command()
 @click.argument("subreddit")
+@click.option("--rules", is_flag=True, help="Include the subreddit's posting rules")
+@click.option("--mods", is_flag=True, help="Include the moderator list")
 @click.option("--json-output", "-j", is_flag=True)
 @click.option("--markdown", "-m", is_flag=True)
 @output_options
 @common_options
 @click.pass_context
-def info(ctx, subreddit, json_output, markdown, jsonl, fields, no_cache, debug):
-    """Get subreddit metadata (subscribers, description, etc.)."""
+def info(ctx, subreddit, rules, mods, json_output, markdown, jsonl, fields, no_cache, debug):
+    """Get subreddit metadata (subscribers, description, rules, moderators)."""
     client = _client(ctx, no_cache, debug)
     result = client.subreddit_info(subreddit)
     if _error_exit(result, jsonl):
         return
-    if jsonl:
-        click.echo(_jsonl_line(_project([result], fields)[0]))
-    elif json_output:
-        click.echo(json.dumps(_project([result], fields)[0] if fields else result, indent=2))
-    elif markdown:
+    rules_res = client.subreddit_rules(subreddit) if rules else None
+    mods_res = client.subreddit_moderators(subreddit) if mods else None
+
+    if jsonl or json_output:
+        out = _project([result], fields)[0] if fields else dict(result)
+        if rules_res and "error" not in rules_res:
+            out["rules"] = rules_res["rules"]
+        if mods_res and "error" not in mods_res:
+            out["moderators"] = mods_res["moderators"]
+        click.echo(_jsonl_line(out) if jsonl else json.dumps(out, indent=2))
+        return
+    if markdown:
         _render_subreddit_detail_markdown(result)
     else:
         _render_subreddit_detail(result)
+    if rules_res and "error" not in rules_res:
+        _render_rules(rules_res, markdown)
+    if mods_res and "error" not in mods_res:
+        _render_mods(mods_res, markdown)
+
+
+@main.command()
+@click.argument("subreddit")
+@click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True)
+@output_options
+@common_options
+@click.pass_context
+def related(ctx, subreddit, limit, jsonl, fields, no_cache, debug):
+    """Find subreddits Reddit associates with SUBREDDIT (discovery cluster)."""
+    client = _client(ctx, no_cache, debug)
+    result = client.related_subreddits(subreddit, limit=limit)
+    if _error_exit(result, jsonl):
+        return
+    if not _emit_structured(result, jsonl, False, fields):
+        _render_subreddits(result, f"Related to r/{subreddit}")
+
+
+@main.command()
+@click.argument("target")
+@click.argument("post_id", required=False)
+@click.option("--limit", "-n", default=25, type=LIMIT_RANGE, show_default=True)
+@output_options
+@common_options
+@click.pass_context
+def crossposts(ctx, target, post_id, limit, jsonl, fields, no_cache, debug):
+    """Show crossposts/reposts of a link across subreddits.
+
+    TARGET is a post URL / t3_ fullname / id (same forms as `thread`).
+    Reveals where else a post was shared and how each community reacted.
+    """
+    client = _client(ctx, no_cache, debug)
+    try:
+        _sub, pid = client.resolve_post_reference(target, post_id)
+    except ValueError as e:
+        _error_exit({"error": str(e)}, jsonl)
+    result = client.duplicates(pid, limit=limit)
+    if _error_exit(result, jsonl):
+        return
+    if jsonl:
+        if result.get("original"):
+            click.echo(_jsonl_line({"original": _project([result["original"]], fields)[0]
+                                    if fields else result["original"]}))
+        for item in _project(result.get("items", []), fields):
+            click.echo(_jsonl_line(item))
+        click.echo(_jsonl_line({"_meta": {"count": result.get("count", 0)}}))
+    elif fields:
+        click.echo(json.dumps({**result, "items": _project(result["items"], fields)}, indent=2))
+    else:
+        orig = result.get("original", {})
+        _render_posts({"items": result.get("items", []),
+                       "count": result.get("count", 0)},
+                      f"Crossposts of: {_truncate(orig.get('title', ''), 50)}")
+
+
+@main.command()
+@click.argument("ids", nargs=-1, required=True)
+@NSFW_FLAG
+@output_options
+@common_options
+@click.pass_context
+def get(ctx, ids, include_nsfw, jsonl, fields, no_cache, debug):
+    """Bulk-fetch posts by fullname/id in ONE request (t3_abc t3_def ...).
+
+    Efficient hydration of many posts at once; also accepts bare ids.
+    """
+    client = _client(ctx, no_cache, debug)
+    fullnames = [i if i.startswith(("t3_", "t1_", "t5_")) else f"t3_{i}" for i in ids]
+    result = client.info_by_fullnames(fullnames, include_nsfw=include_nsfw)
+    if _error_exit(result, jsonl):
+        return
+    _output_posts(result, f"{len(result.get('items', []))} items", False, False, jsonl, fields)
 
 
 @main.command()
@@ -883,7 +1035,7 @@ def thread(ctx, target, post_id, sort, limit, depth, no_expand, author_filter, m
     """
     client = _client(ctx, no_cache, debug)
     try:
-        subreddit, pid = parse_post_reference(target, post_id)
+        subreddit, pid = client.resolve_post_reference(target, post_id)
     except ValueError as e:
         if jsonl:
             click.echo(_jsonl_line({"error": str(e), "retryable": False}))
@@ -1111,18 +1263,20 @@ def popular_subs(ctx, limit, after, pages, include_nsfw, json_output, markdown, 
 @click.option("--thread-comments", default=10, type=click.IntRange(1, 50), show_default=True,
               help="Comments to fetch per excerpted thread")
 @click.option("--query", "-q", default=None, help="Also run a post search within the subreddit")
+@click.option("--rules", is_flag=True, help="Include the subreddit's posting rules (+1 request)")
+@click.option("--related", is_flag=True, help="Include related subreddits (+1 request)")
 @NSFW_FLAG
 @SAVE_FLAG
 @click.option("--json-output", "-j", is_flag=True)
 @common_options
 @click.pass_context
 def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, query,
-           include_nsfw, save_topic, json_output, no_cache, debug):
+           rules, related, include_nsfw, save_topic, json_output, no_cache, debug):
     """One-shot recon: info + top posts + top-thread excerpts (+ optional search).
 
     Replaces the usual 10-15 command opening sweep of a research session with
     a single markdown document (or -j for the full structured data).
-    Cost: 2 + THREADS (+1 with --query) API requests.
+    Cost: 2 + THREADS (+1 each for --query/--rules/--related) API requests.
     """
     client = _client(ctx, no_cache, debug)
 
@@ -1133,6 +1287,9 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
                                        limit=limit, include_nsfw=include_nsfw)
     if _error_exit(posts_res):
         return
+
+    rules_res = client.subreddit_rules(subreddit) if rules else None
+    related_res = client.related_subreddits(subreddit, limit=15) if related else None
 
     top_posts = posts_res.get("items", [])
     threads, skipped = [], []
@@ -1156,6 +1313,12 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
         # Markdown document (default — a digest is a report, not a table)
         click.echo(f"# r/{info_res.get('name', subreddit)} digest — top/{time_filter}")
         click.echo(f"\n{info_res.get('subscribers', 0):,} subscribers — {info_res.get('description', '')}\n")
+        if rules_res and "error" not in rules_res and rules_res.get("rules"):
+            _render_rules(rules_res, markdown=True)
+            click.echo("")
+        if related_res and "error" not in related_res and related_res.get("items"):
+            names = ", ".join(f"r/{i['name']}" for i in related_res["items"])
+            click.echo(f"**Related subreddits:** {names}\n")
         _render_posts_markdown(posts_res, f"Top posts ({time_filter})")
         for t in threads:
             click.echo("\n---\n")
@@ -1175,6 +1338,10 @@ def digest(ctx, subreddit, time_filter, limit, thread_count, thread_comments, qu
 
     if json_output:
         out = {"info": info_res, "top_posts": posts_res, "threads": threads}
+        if rules_res and "error" not in rules_res:
+            out["rules"] = rules_res["rules"]
+        if related_res and "error" not in related_res:
+            out["related"] = related_res["items"]
         if skipped:
             out["skipped_threads"] = skipped
         if search_res is not None:
@@ -1235,7 +1402,7 @@ def media(ctx, target, sort, time_filter, limit, pages, seen_name, max_files, ma
         if seen_name:
             click.echo("note: --seen has no effect on a single post", err=True)
         try:
-            sub, pid = parse_post_reference(target)
+            sub, pid = client.resolve_post_reference(target)
         except ValueError as e:
             _error_exit({"error": str(e)}, jsonl)
         result = client.post_comments(sub, pid, limit=1, expand_more=False)

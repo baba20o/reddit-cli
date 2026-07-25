@@ -16,6 +16,8 @@ from reddit.cli import main, _parse_since, _apply_since, _project
 def _invoke(args, client=None, seen_path=None):
     client = client or MagicMock()
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     patches = [patch("reddit.cli.RedditClient", return_value=client)]
     if seen_path is not None:
         patches.append(patch("reddit.cli.SeenStore", lambda: SeenStore(str(seen_path))))
@@ -63,6 +65,8 @@ def test_unknown_field_warns_on_stderr():
     client = _search_client([POST_ITEM])
     runner = CliRunner(mix_stderr=False)
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     with patch("reddit.cli.RedditClient", return_value=client):
         result = runner.invoke(main, ["search", "x", "--jsonl", "--fields", "id,bogus"])
     assert "unknown field(s) bogus" in result.stderr
@@ -87,6 +91,8 @@ def test_jsonl_error_retryable_classification():
     client = MagicMock()
     client.search.return_value = {"error": "Rate limited (HTTP 429) after retries"}
     client.paginate.side_effect = lambda method, pages=1, **kw: method(**kw)
+    from reddit.api import parse_post_reference as _ppr
+    client.resolve_post_reference.side_effect = _ppr
     result, _ = _invoke(["search", "x", "--jsonl"], client)
     assert result.exit_code == 1
     err = json.loads(result.output.strip())
