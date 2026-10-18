@@ -21,7 +21,10 @@ export REDDIT_USERNAME="your_username"      # optional, for higher rate limits
 export REDDIT_PASSWORD="your_password"      # optional, for higher rate limits
 ```
 
-Or create a `.env` file (never commit this):
+Or create a `.env` file in the repository root, next to `pyproject.toml`
+(never commit this). It is looked up from the installed package's location,
+not your current directory, and variables already exported in your shell take
+precedence:
 
 ```
 REDDIT_CLIENT_ID=your_client_id
@@ -118,7 +121,7 @@ reddit search "LLM" -m
 | `-r, --subreddit` | Restrict search to a subreddit |
 | `-s, --sort` | Sort order (relevance, hot, top, new, comments, rising, controversial) |
 | `-t, --time` | Time filter (hour, day, week, month, year, all) |
-| `-n, --limit` | Max results (1-100, default: 25; `thread` allows up to 500) |
+| `-n, --limit` | Max results (1-100, default: 25; `thread` defaults to 50 and allows up to 500) |
 | `--after` | Pagination cursor (from previous result) |
 | `--nsfw / --no-nsfw` | Include NSFW (over 18) results (default: hidden, with a note) |
 | `-j, --json-output` | Raw JSON output |
@@ -237,6 +240,7 @@ get the video-only stream and a note saying so.
 
 | Flag | Description |
 |------|-------------|
+| `-s, --sort` | Comment order: best (default), top, new, controversial, old, qa |
 | `-d, --depth` | Max reply depth to descend (default: unlimited) |
 | `--no-expand` | Don't fetch "load more" comment stubs (fewer API calls) |
 
@@ -284,8 +288,9 @@ reddit search "rust" -n 100 --after t3_next123
 
 - **Auth:** OAuth2 script-type (client_id + client_secret + username + password)
 - **Base URL:** `https://oauth.reddit.com`
-- **Rate limit:** 100 requests/minute (self-limited to 1 req/sec)
+- **Rate limit:** 100 requests/minute (self-limited to 1 req/sec, shared across concurrent `reddit` processes)
 - **Cache:** 30-minute TTL file cache at `~/.reddit_cache/`
+- **State:** `--seen` stores, topic configs and the rate-limit clock live in `~/.reddit/` (`seen.json`, `topics.json`, `rate_limit.db`)
 - **Token:** Auto-refreshes before expiry (3600s lifetime, refresh at 3000s)
 
 ## Development
